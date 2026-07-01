@@ -33,7 +33,7 @@ from urllib.parse import quote
 # 1) Use QC_STUDIO_DB_PATH env var if set
 # 2) Else default to a workspace-local file
 DB_PATH = Path(
-    os.getenv("QC_STUDIO_DB_PATH", str(Path(__file__).parent / "another_panel.db"))
+    os.getenv("QC_STUDIO_DB_PATH", str(Path(__file__).parent / "test_panel.db"))
 )
 
 SAMPLE_TYPES = [
