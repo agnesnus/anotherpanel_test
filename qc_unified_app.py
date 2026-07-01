@@ -1,15 +1,13 @@
 """
 QC Studio — Unified Application
 ================================
-Integrated platform for steroid panel database management, QC data export, and dashboard visualization.
+Integrated platform for test panel database management, QC data export, and dashboard visualization.
 
 Features:
-1. Steroid Panel Database: SQLite database for LC-MS/MS steroid panel results (built from uploaded files)
+1. Test Panel Database: SQLite database for LC-MS/MS test panel results (built from uploaded files)
 2. QC Export: Export CSV files with HQC and LQC values for all hormones
 3. QC Dashboard: Interactive Levey-Jennings charts with 2SD/3SD bands
 
-Run:
-    streamlit run qc_unified_app.py --server.address localhost --server.port 8501
 """
 
 import sqlite3
@@ -31,28 +29,12 @@ from urllib.parse import quote
 # CONFIGURATION
 # ==============================================================================
 
-DB_PATH = Path(__file__).parent / "steroid_panel.db"
-
-ANALYTES = [
-    {"name": "11-deoxycorticosterone", "panel": 1, "display_order": 1},
-    {"name": "11-deoxycortisol", "panel": 1, "display_order": 2},
-    {"name": "17-hydroxyprogesterone", "panel": 1, "display_order": 3},
-    {"name": "21-deoxycortisol", "panel": 1, "display_order": 4},
-    {"name": "Aldosterone", "panel": 1, "display_order": 5},
-    {"name": "Androstenedione", "panel": 1, "display_order": 6},
-    {"name": "Corticosterone", "panel": 1, "display_order": 7},
-    {"name": "Cortisol", "panel": 1, "display_order": 8},
-    {"name": "Cortisone", "panel": 1, "display_order": 9},
-    {"name": "Dexamethasone", "panel": 1, "display_order": 10},
-    {"name": "DHEA", "panel": 1, "display_order": 11},
-    {"name": "DHEAS", "panel": 1, "display_order": 12},
-    {"name": "Dihydrotestosterone", "panel": 1, "display_order": 13},
-    {"name": "Progesterone", "panel": 1, "display_order": 14},
-    {"name": "Testosterone", "panel": 1, "display_order": 15},
-    {"name": "17-hydroxypregnenolone", "panel": 2, "display_order": 16},
-    {"name": "Estradiol", "panel": 2, "display_order": 17},
-    {"name": "Estrone", "panel": 2, "display_order": 18},
-]
+# Persistent DB location:
+# 1) Use QC_STUDIO_DB_PATH env var if set
+# 2) Else default to a workspace-local file
+DB_PATH = Path(
+    os.getenv("QC_STUDIO_DB_PATH", str(Path(__file__).parent / "another_panel.db"))
+)
 
 SAMPLE_TYPES = [
     {"type_code": "calibrator", "description": "Calibration standards (Cal 0 through Cal F)"},
@@ -294,6 +276,7 @@ def ensure_uploaded_by_column(conn):
 
 def get_connection(db_path=None):
     db_path = db_path or DB_PATH
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys = ON")
     ensure_uploaded_by_column(conn)
@@ -307,15 +290,6 @@ def ensure_db_initialized(db_path=None):
     
     # Create schema if not exists
     conn.executescript(SCHEMA_SQL)
-
-    # Seed analytes if not already present
-    cursor.execute("SELECT COUNT(*) FROM analytes")
-    if cursor.fetchone()[0] == 0:
-        for analyte in ANALYTES:
-            conn.execute(
-                "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
-                (analyte["name"], analyte["panel"], analyte["display_order"])
-            )
 
     # Seed sample types if not already present
     cursor.execute("SELECT COUNT(*) FROM sample_types")
@@ -336,51 +310,86 @@ def ensure_db_initialized(db_path=None):
 
 def detect_format(csv_path: str) -> str:
     """Detect whether CSV is old or new format by checking header row."""
-    df_header = pd.read_csv(csv_path, nrows=1, header=0)
-    second_row = df_header.iloc[0].tolist() if len(df_header) > 0 else []
-    second_row_strs = [str(v).strip() for v in second_row if pd.notna(v)]
-    if "Data Path" in second_row_strs:
-        return "new"
+    try:
+        df_header = pd.read_csv(csv_path, nrows=1, header=0)
+        second_row = df_header.iloc[0].tolist() if len(df_header) > 0 else []
+        second_row_strs = [str(v).strip() for v in second_row if pd.notna(v)]
+        if "Data Path" in second_row_strs:
+            return "new"
+    except Exception:
+        pass
     return "old"
 
 
-def parse_filename_old(filepath: str) -> dict:
-    """Parse '20260206_Panel1_conc(in).csv' → run metadata."""
+def parse_filename_any(filepath: str) -> dict:
+    """Extract run metadata from any filename.
+    Tries several common patterns, then falls back to today's date / panel 1.
+    Accepts CSV, XLS, and XLSX files with any name.
+    """
     basename = Path(filepath).name
-    match = re.match(r"^(\d{8})_Panel(\d+)_conc\(in\)\.csv$", basename)
-    if not match:
-        raise ValueError(f"Filename does not match old pattern: {basename}")
-    date_str = match.group(1)
-    run_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
-    panel = int(match.group(2))
-    return {"run_date": run_date, "panel": panel, "source_filename": basename, "method_name": None}
+
+    # Pattern: 20260206_Panel1_conc(in).csv  (old format)
+    m = re.match(r"^(\d{8})_Panel(\d+)", basename)
+    if m:
+        date_str = m.group(1)
+        return {
+            "run_date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
+            "panel": int(m.group(2)),
+            "source_filename": basename,
+            "method_name": None,
+        }
+
+    # Pattern: METHOD_20260420_P1(Sheet1).csv  (new format)
+    m = re.match(r"^(.+?)_(\d{8})_P(\d+)", basename)
+    if m:
+        date_str = m.group(2)
+        return {
+            "run_date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
+            "panel": int(m.group(3)),
+            "source_filename": basename,
+            "method_name": m.group(1),
+        }
+
+    # Fallback: try to find any 8-digit date anywhere in the filename
+    date_match = re.search(r"(\d{8})", basename)
+    run_date = datetime.today().strftime("%Y-%m-%d")
+    if date_match:
+        d = date_match.group(1)
+        run_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+    # Try to find panel number
+    panel_match = re.search(r"[Pp](?:anel)?(\d+)", basename)
+    panel = int(panel_match.group(1)) if panel_match else 1
+
+    return {
+        "run_date": run_date,
+        "panel": panel,
+        "source_filename": basename,
+        "method_name": None,
+    }
+
+
+# Keep old names as aliases so nothing else breaks
+def parse_filename_old(filepath: str) -> dict:
+    return parse_filename_any(filepath)
 
 
 def parse_filename_new(filepath: str) -> dict:
-    """Parse 'ISOSP-23_20260420_P1(Sheet1).csv' → run metadata."""
-    basename = Path(filepath).name
-    match = re.match(r"^(.+?)_(\d{8})_P(\d+)(?:-\w+)?\(Sheet\d+\)\.csv$", basename)
-    if not match:
-        raise ValueError(f"Filename does not match new pattern: {basename}")
-    method_name = match.group(1)
-    date_str = match.group(2)
-    run_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
-    panel = int(match.group(3))
-    return {"run_date": run_date, "panel": panel, "source_filename": basename, "method_name": method_name}
+    return parse_filename_any(filepath)
 
 
 # ==============================================================================
 # CSV IMPORTER — OLD FORMAT
 # ==============================================================================
 
-def import_csv_old(csv_path: str, db_path=None, uploaded_by=None):
+def import_csv_old(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
     """Import old-format CSV."""
     ensure_db_initialized(db_path)
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
     uploaded_by = str(uploaded_by).strip().upper() if uploaded_by else None
-    meta = parse_filename_old(csv_path)
+    meta = parse_filename_old(original_filename or csv_path)
 
     cursor.execute("SELECT run_id FROM runs WHERE source_filename = ?", (meta["source_filename"],))
     if cursor.fetchone():
@@ -395,11 +404,18 @@ def import_csv_old(csv_path: str, db_path=None, uploaded_by=None):
     df = pd.read_csv(csv_path, header=0)
     df = df.iloc[1:].reset_index(drop=True)
 
-    analyte_columns = [col.replace(" Results", "").strip() for col in df.columns[1:]]
+    analyte_columns = [normalize_analyte_name(col.replace(" Results", "").strip()) for col in df.columns[1:]]
 
     analyte_id_map = {}
-    for name in analyte_columns:
-        cursor.execute("SELECT analyte_id FROM analytes WHERE name = ?", (name,))
+    for i, name in enumerate(analyte_columns):
+        conn.execute(
+            "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
+            (name, meta["panel"], i + 1)
+        )
+        cursor.execute(
+            "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
+            (name,)
+        )
         row = cursor.fetchone()
         if row:
             analyte_id_map[name] = row[0]
@@ -455,14 +471,14 @@ def import_csv_old(csv_path: str, db_path=None, uploaded_by=None):
 # CSV IMPORTER — NEW FORMAT
 # ==============================================================================
 
-def import_csv_new(csv_path: str, db_path=None, uploaded_by=None):
+def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
     """Import new-format CSV with full metadata columns."""
     ensure_db_initialized(db_path)
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
     uploaded_by = str(uploaded_by).strip().upper() if uploaded_by else None
-    meta = parse_filename_new(csv_path)
+    meta = parse_filename_new(original_filename or csv_path)
 
     cursor.execute("SELECT run_id FROM runs WHERE source_filename = ?", (meta["source_filename"],))
     if cursor.fetchone():
@@ -479,7 +495,7 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None):
         if "Results" in h_str:
             if analyte_start_idx is None:
                 analyte_start_idx = i
-            analyte_columns.append(h_str.replace(" Results", "").strip())
+            analyte_columns.append(normalize_analyte_name(h_str.replace(" Results", "").strip()))
 
     if analyte_start_idx is None:
         return "Error: Could not find analyte Results columns in CSV header"
@@ -513,8 +529,15 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None):
     run_id = cursor.lastrowid
 
     analyte_id_map = {}
-    for name in analyte_columns:
-        cursor.execute("SELECT analyte_id FROM analytes WHERE name = ?", (name,))
+    for i, name in enumerate(analyte_columns):
+        conn.execute(
+            "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
+            (name, meta["panel"], i + 1)
+        )
+        cursor.execute(
+            "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
+            (name,)
+        )
         row = cursor.fetchone()
         if row:
             analyte_id_map[name] = row[0]
@@ -585,13 +608,13 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None):
     return f"Imported {imported_count} samples from {meta['source_filename']}"
 
 
-def import_csv(csv_path: str, db_path=None, uploaded_by=None):
+def import_csv(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
     """Auto-detect format and import CSV."""
     fmt = detect_format(csv_path)
     if fmt == "old":
-        return import_csv_old(csv_path, db_path, uploaded_by)
+        return import_csv_old(csv_path, db_path, uploaded_by, original_filename=original_filename)
     else:
-        return import_csv_new(csv_path, db_path, uploaded_by)
+        return import_csv_new(csv_path, db_path, uploaded_by, original_filename=original_filename)
 
 
 def normalize_qc_level(value):
@@ -661,24 +684,45 @@ def extract_date_from_filename(filename):
 
 
 def normalize_analyte_name(name):
+    """Return a canonical analyte display name to avoid duplicate aliases (e.g., DHEAS vs DHEA-S)."""
     if pd.isna(name):
         return ""
-    normalized = re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
-    return normalized
+    raw = str(name).strip()
+    key = re.sub(r"[^a-z0-9]", "", raw.lower())
+
+    alias_map = {
+        "dheas": "DHEA-S",
+        "dht": "DHT",
+        "dihydrotestosterone": "DHT",
+    }
+    return alias_map.get(key, raw)
+
+
+# Generic sheet names that should not be treated as analyte names
+_EXCLUDED_SHEET_NAMES = {
+    "sheet1", "sheet2", "sheet3", "sheet4", "sheet5",
+    "summary", "data", "results", "targets", "overview",
+    "template", "index", "contents", "",
+}
 
 
 def find_analyte_name_in_workbook(sheet_name, sample_row=None):
-    analyte_map = {normalize_analyte_name(a["name"]): a["name"] for a in ANALYTES}
-    normalized_sheet = normalize_analyte_name(sheet_name)
-    if normalized_sheet in analyte_map:
-        return analyte_map[normalized_sheet]
+    """Derive the analyte name from a sheet name or the first row of data.
+    No hardcoded analyte list — names come entirely from the uploaded file."""
+    cleaned = str(sheet_name).strip()
+    if cleaned and cleaned.lower() not in _EXCLUDED_SHEET_NAMES:
+        return cleaned
 
+    # Fall back: look for a non-numeric, non-empty cell in sample_row
     if sample_row is not None:
         for value in sample_row:
             if pd.notna(value):
-                normalized_value = normalize_analyte_name(value)
-                if normalized_value in analyte_map:
-                    return analyte_map[normalized_value]
+                candidate = str(value).strip()
+                if candidate and candidate.lower() not in _EXCLUDED_SHEET_NAMES:
+                    try:
+                        float(candidate)  # skip numeric values
+                    except ValueError:
+                        return candidate
 
     return None
 
@@ -746,6 +790,7 @@ def parse_qc_targets_from_sheet(sheet_name, df, file_date):
     analyte = find_analyte_name_in_workbook(sheet_name, sample_row=df.iloc[0].tolist() if len(df) > 0 else None)
     if analyte is None:
         return []
+    analyte = normalize_analyte_name(analyte)
 
     header_row_idx, header_row = find_qc_summary_header_row(df)
     if header_row_idx is None or header_row_idx + 1 >= len(df):
@@ -827,6 +872,7 @@ def parse_qc_run_rows_from_sheet(sheet_name, df):
     analyte = find_analyte_name_in_workbook(sheet_name, sample_row=df.iloc[0].tolist() if len(df) > 0 else None)
     if analyte is None:
         return []
+    analyte = normalize_analyte_name(analyte)
 
     header_row_idx, header_row = find_qc_run_header_row(df)
     if header_row_idx is None:
@@ -884,6 +930,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
     db_path = db_path or DB_PATH
     if not Path(db_path).exists():
         return None
+    analyte_name = normalize_analyte_name(analyte_name)
 
     # Normalize as_of_date to YYYY-MM-DD string
     if as_of_date is None:
@@ -908,7 +955,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
         SELECT qt.target_mean, qt.target_sd
         FROM qc_targets qt
         JOIN analytes a ON qt.analyte_id = a.analyte_id
-        WHERE a.name = ?
+        WHERE lower(a.name) = lower(?)
           AND qt.qc_level = ?
           AND qt.effective_from <= ?
           AND (qt.effective_to IS NULL OR qt.effective_to >= ?)
@@ -922,7 +969,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
             SELECT qt.target_mean, qt.target_sd
             FROM qc_targets qt
             JOIN analytes a ON qt.analyte_id = a.analyte_id
-            WHERE a.name = ?
+            WHERE lower(a.name) = lower(?)
               AND qt.qc_level = ?
               AND qt.effective_from <= ?
             ORDER BY qt.effective_from DESC
@@ -936,7 +983,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
             SELECT qt.target_mean, qt.target_sd
             FROM qc_targets qt
             JOIN analytes a ON qt.analyte_id = a.analyte_id
-            WHERE a.name = ?
+            WHERE lower(a.name) = lower(?)
               AND qt.qc_level = ?
             ORDER BY qt.effective_from DESC
             LIMIT 1
@@ -978,11 +1025,15 @@ def insert_qc_target(analyte_name, qc_level, target_mean, target_sd,
                      effective_from, effective_to=None, lot_number=None, db_path=None):
     """Insert or replace a QC target row. Also closes the previous open row for that analyte/level."""
     db_path = db_path or DB_PATH
+    analyte_name = normalize_analyte_name(analyte_name)
     ensure_db_initialized(db_path)
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT analyte_id FROM analytes WHERE name = ?", (analyte_name,))
+    cursor.execute(
+        "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
+        (analyte_name,)
+    )
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -1010,6 +1061,152 @@ def insert_qc_target(analyte_name, qc_level, target_mean, target_sd,
     conn.close()
 
 
+def import_tecan_qc_file(file_bytes, filename, db_path=None):
+    """Import Tecan format QC targets from Excel (multiple sheets with HQC/LQC structure)."""
+    db_path = db_path or DB_PATH
+    ensure_db_initialized(db_path)
+    
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+    except Exception as e:
+        raise ValueError(f"Failed to read Excel file: {str(e)}")
+    
+    # Skip non-analyte sheets
+    skip_sheets = {' INDEX', ' TECAN calibrants', ' TECAN QC concentrations'}
+    analyte_sheets = [s for s in xls.sheet_names if s not in skip_sheets]
+    
+    if not analyte_sheets:
+        return "No analyte sheets found in workbook."
+    
+    imported = 0
+    skipped_inconsistent = 0
+    default_from = extract_date_from_filename(filename) or datetime.today().strftime("%Y-%m-%d")
+    
+    for sheet_name in analyte_sheets:
+        analyte_name = normalize_analyte_name(sheet_name.strip())
+        
+        # Read the sheet
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None)
+        
+        # Look for the header row (row 13 in 0-indexed is row 12, but check around there)
+        header_row_idx = None
+        for idx in range(0, min(20, len(df))):
+            row_vals = df.iloc[idx].astype(str).str.lower()
+            if any('tecan' in str(v) for v in row_vals) and any('outlier' in str(v) for v in row_vals):
+                header_row_idx = idx
+                break
+        
+        if header_row_idx is None:
+            continue  # Skip if can't find header
+        
+        # Find column indices for HQC and LQC
+        header = df.iloc[header_row_idx].astype(str).str.lower()
+
+        # Detect explicit section markers (HQC/LQC) from rows above the header row.
+        # Then assign each data column to the nearest section marker to avoid HQC/LQC cross-mapping.
+        section_markers = []
+        section_scan_start = max(0, header_row_idx - 8)
+        for r in range(section_scan_start, header_row_idx):
+            row_vals = df.iloc[r].astype(str).str.strip().str.lower()
+            for c_idx, cell in enumerate(row_vals):
+                if cell == "hqc":
+                    section_markers.append((c_idx, "HQC"))
+                elif cell == "lqc":
+                    section_markers.append((c_idx, "LQC"))
+
+        def resolve_section(col_idx):
+            if section_markers:
+                left_markers = [m for m in section_markers if m[0] <= col_idx]
+                if left_markers:
+                    # Use the nearest marker to the left in the sheet layout.
+                    return max(left_markers, key=lambda x: x[0])[1]
+                # Fallback: nearest marker by absolute distance.
+                return min(section_markers, key=lambda x: abs(x[0] - col_idx))[1]
+            # Final fallback only if markers are missing.
+            return "HQC" if col_idx < len(header) / 2 else "LQC"
+
+        # Find "Tecan Conc." and "Outlier filtered" columns and map each to HQC/LQC section.
+        tecan_cols = {}
+        outlier_cols = {}
+
+        for col_idx in range(len(header)):
+            h = header.iloc[col_idx]
+            if 'tecan' in h and 'conc' in h:
+                tecan_cols[resolve_section(col_idx)] = col_idx
+            elif 'outlier' in h and 'filter' in h:
+                outlier_cols[resolve_section(col_idx)] = col_idx
+        
+        # Extract and import HQC and LQC data
+        data_start = header_row_idx + 1
+        
+        for sheet_qc_level in ["HQC", "LQC"]:
+            if sheet_qc_level not in tecan_cols or sheet_qc_level not in outlier_cols:
+                continue
+            
+            tecan_col = tecan_cols[sheet_qc_level]
+            outlier_col = outlier_cols[sheet_qc_level]
+            
+            # Get the data rows (skip empty rows)
+            tecan_data = df.iloc[data_start:, tecan_col]
+            outlier_data = df.iloc[data_start:, outlier_col]
+            
+            # Convert to numeric, dropping NaN
+            tecan_numeric = pd.to_numeric(tecan_data, errors='coerce').dropna()
+            outlier_numeric = pd.to_numeric(outlier_data, errors='coerce').dropna()
+            
+            if len(outlier_numeric) == 0:
+                continue
+            
+            # Use QC mean/SD from outlier-filtered values so the target is stable and level-specific.
+            target_mean = float(outlier_numeric.mean())
+            target_sd = float(outlier_numeric.std(ddof=1)) if len(outlier_numeric) > 1 else float(outlier_numeric.std())
+            
+            if pd.isna(target_mean) or pd.isna(target_sd) or target_sd == 0:
+                continue
+            
+            # Convert HQC/LQC to High/Low for database storage (matches chart code)
+            db_qc_level = "High" if sheet_qc_level == "HQC" else "Low"
+            
+            # Sanity check against previous same-level target: if jump is too large, skip to avoid HQC/LQC mix-ups.
+            conn_chk = get_connection(db_path)
+            prev = conn_chk.execute(
+                """
+                SELECT qt.target_mean
+                FROM qc_targets qt
+                JOIN analytes a ON qt.analyte_id = a.analyte_id
+                WHERE lower(a.name) = lower(?)
+                  AND qt.qc_level = ?
+                  AND qt.effective_from < ?
+                ORDER BY qt.effective_from DESC
+                LIMIT 1
+                """,
+                (analyte_name, db_qc_level, default_from)
+            ).fetchone()
+            conn_chk.close()
+
+            if prev and prev[0] is not None and float(prev[0]) > 0:
+                prev_mean = float(prev[0])
+                relative_change = abs(target_mean - prev_mean) / prev_mean
+                # >60% jump is usually a sign of wrong section mapping for QC targets.
+                if relative_change > 0.60:
+                    skipped_inconsistent += 1
+                    continue
+
+            try:
+                insert_qc_target(
+                    analyte_name, db_qc_level, float(target_mean), float(target_sd),
+                    default_from, db_path=db_path
+                )
+                imported += 1
+            except Exception as e:
+                pass  # Skip individual errors
+
+    msg = f"Imported {imported} QC target(s) from Tecan format."
+    if skipped_inconsistent:
+        msg += f" Skipped {skipped_inconsistent} target(s) due to large deviation from previous same-level target."
+    return msg
+
+
 def import_qc_targets_file(file_bytes, filename, db_path=None):
     """Import mean/SD targets from CSV/Excel file into qc_targets."""
     db_path = db_path or DB_PATH
@@ -1019,6 +1216,15 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
     if suffix == ".csv":
         df = pd.read_csv(BytesIO(file_bytes))
     elif suffix in {".xls", ".xlsx"}:
+        # Try to detect if it's Tecan format (has sheet names with analyte names)
+        try:
+            xls = pd.ExcelFile(BytesIO(file_bytes))
+            if any('tecan' in s.lower() for s in xls.sheet_names) or len([s for s in xls.sheet_names if s not in {' INDEX', ' TECAN calibrants', ' TECAN QC concentrations'}]) > 5:
+                # Likely Tecan format
+                return import_tecan_qc_file(file_bytes, filename, db_path)
+        except:
+            pass
+        
         df = pd.read_excel(BytesIO(file_bytes))
     else:
         raise ValueError("Unsupported target file type. Please upload CSV or Excel.")
@@ -1036,15 +1242,28 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
 
     analyte_col = pick("analyte", "hormone", "compound", "name")
     level_col = pick("qc_level", "qc level", "level", "type")
-    mean_col = pick("target_mean", "target mean", "mean", "qc mean")
-    sd_col = pick("target_sd", "target sd", "sd")
+    mean_col = pick("target_mean", "target mean", "mean", "qc mean", "tecan conc")
+    sd_col = pick("target_sd", "target sd", "sd", "cv", "outlier filtered out")
     from_col = pick("effective_from", "effective from", "from", "date")
     to_col = pick("effective_to", "effective to", "to")
     lot_col = pick("lot_number", "lot number", "lot")
 
-    if not analyte_col or not level_col or not mean_col or not sd_col:
+    # Build helpful error message if columns are missing
+    missing = []
+    if not analyte_col:
+        missing.append("analyte (try: analyte, hormone, compound, name)")
+    if not level_col:
+        missing.append("qc_level (try: qc_level, qc level, level, type)")
+    if not mean_col:
+        missing.append("target_mean (try: target_mean, target mean, mean, qc mean, tecan conc)")
+    if not sd_col:
+        missing.append("target_sd (try: target_sd, target sd, sd, cv, outlier filtered out)")
+    
+    if missing:
+        available = ", ".join([f"'{c}'" for c in df.columns])
         raise ValueError(
-            "Targets file must include columns for analyte, qc_level, target_mean, and target_sd."
+            f"Targets file is missing: {' + '.join(missing)}.\n"
+            f"Available columns: {available}"
         )
 
     default_from = extract_date_from_filename(filename) or datetime.today().strftime("%Y-%m-%d")
@@ -1052,7 +1271,7 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
     skipped = 0
 
     for _, row in df.iterrows():
-        analyte_name = str(row[analyte_col]).strip() if pd.notna(row[analyte_col]) else ""
+        analyte_name = normalize_analyte_name(str(row[analyte_col]).strip()) if pd.notna(row[analyte_col]) else ""
         if not analyte_name:
             skipped += 1
             continue
@@ -1149,7 +1368,7 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
 
         if hqc_value_columns or lqc_value_columns:
             for _, row in df.iterrows():
-                analyte = str(row[analyte_col]).strip() if pd.notna(row[analyte_col]) else None
+                analyte = normalize_analyte_name(str(row[analyte_col]).strip()) if pd.notna(row[analyte_col]) else None
                 if not analyte:
                     continue
 
@@ -1183,7 +1402,7 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
                     })
         elif qc_level_col is not None and value_col is not None:
             for _, row in df.iterrows():
-                analyte = str(row[analyte_col]).strip() if pd.notna(row[analyte_col]) else None
+                analyte = normalize_analyte_name(str(row[analyte_col]).strip()) if pd.notna(row[analyte_col]) else None
                 if not analyte:
                     continue
 
@@ -1226,7 +1445,10 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
 
     if qc_targets:
         for target in qc_targets:
-            cursor.execute("SELECT analyte_id FROM analytes WHERE name = ?", (target["analyte"],))
+            cursor.execute(
+                "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
+                (target["analyte"],)
+            )
             row = cursor.fetchone()
             if not row:
                 continue
@@ -1239,10 +1461,18 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
     analyte_id_map = {}
     for record in records:
         analyte = record["analyte"]
-        cursor.execute("SELECT analyte_id FROM analytes WHERE name = ?", (analyte,))
-        row = cursor.fetchone()
-        if row:
-            analyte_id_map[analyte] = row[0]
+        if analyte not in analyte_id_map:
+            conn.execute(
+                "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
+                (analyte, 1, None)
+            )
+            cursor.execute(
+                "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
+                (analyte,)
+            )
+            row = cursor.fetchone()
+            if row:
+                analyte_id_map[analyte] = row[0]
 
     cursor.execute("SELECT type_code, type_id FROM sample_types")
     type_map = dict(cursor.fetchall())
@@ -1321,8 +1551,14 @@ def query_run_summary(db_path=None):
     conn = get_connection(db_path)
     query = """
         SELECT
-            r.run_id, r.run_date, r.panel, r.method_name, r.source_filename, r.uploaded_by, r.imported_at,
-            COUNT(DISTINCT s.sample_id) as sample_count
+            r.run_id        AS "ID",
+            r.run_date      AS "Run Date",
+            r.panel         AS "Panel",
+            r.method_name   AS "Method",
+            r.source_filename AS "File Name",
+            r.uploaded_by   AS "Uploaded By",
+            r.imported_at   AS "Imported At",
+            COUNT(DISTINCT s.sample_id) AS "Samples"
         FROM runs r
         LEFT JOIN samples s ON r.run_id = s.run_id
         GROUP BY r.run_id ORDER BY r.run_date DESC
@@ -1701,7 +1937,8 @@ def generate_final_report(db_path=None):
 def main():
     st.set_page_config(page_title="QC Studio", layout="wide")
     st.title("🧪 QC Studio")
-    st.markdown("Integrated steroid panel database, QC export, and dashboard platform")
+    st.markdown("Integrated test panel database, QC export, and dashboard platform")
+    st.sidebar.caption(f"DB: {DB_PATH}")
 
     # Sidebar navigation
     module_options = ["Dashboard", "Database", "Export", "Report"]
@@ -1747,7 +1984,7 @@ def main():
                             with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
                                 tmp.write(uploaded_file.getbuffer())
                                 tmp_path = tmp.name
-                            result = import_csv(tmp_path, uploaded_by=initials)
+                            result = import_csv(tmp_path, uploaded_by=initials, original_filename=uploaded_file.name)
                         elif suffix in {".xls", ".xlsx"}:
                             result = import_excel_qc_file(uploaded_file.read(), uploaded_file.name, uploaded_by=initials)
                         else:
@@ -1801,7 +2038,22 @@ def main():
             if not DB_PATH.exists():
                 st.warning("Import data first to initialise the database.")
             else:
-                all_analyte_names = sorted([a["name"] for a in ANALYTES])
+                conn_tmp = get_connection()
+                all_analyte_names = [
+                    r[0]
+                    for r in conn_tmp.execute(
+                        """
+                        SELECT MIN(name) AS name
+                        FROM analytes
+                        GROUP BY lower(name)
+                        ORDER BY lower(name)
+                        """
+                    ).fetchall()
+                ]
+                conn_tmp.close()
+                if not all_analyte_names:
+                    st.info("No analytes in database yet. Import a data file first to populate analyte names.")
+                    all_analyte_names = ["— no analytes —"]
                 t_col1, t_col2 = st.columns(2)
                 with t_col1:
                     t_analyte = st.selectbox("Hormone", all_analyte_names, key="t_analyte")
@@ -1907,6 +2159,10 @@ def main():
             hqc_concentrations = hqc_data["concentration"].tolist()
             hqc_raw_dates = hqc_data["run_date"].tolist()
             hqc_dates = [d.replace("-", "/") for d in hqc_raw_dates]
+            if len(set(hqc_raw_dates)) <= 1:
+                chart_cols[0].warning(
+                    f"HQC points for {selected} are from a single run date, so the trend line may look collapsed."
+                )
             hqc_targets = get_per_date_targets(selected, "High", hqc_raw_dates)
             has_targets = any(t is not None for t in hqc_targets)
             if has_targets:
@@ -1942,6 +2198,10 @@ def main():
             lqc_concentrations = lqc_data["concentration"].tolist()
             lqc_raw_dates = lqc_data["run_date"].tolist()
             lqc_dates = [d.replace("-", "/") for d in lqc_raw_dates]
+            if len(set(lqc_raw_dates)) <= 1:
+                chart_cols[1].warning(
+                    f"LQC points for {selected} are from a single run date, so the trend line may look collapsed."
+                )
             lqc_targets = get_per_date_targets(selected, "Low", lqc_raw_dates)
             has_lqc_targets = any(t is not None for t in lqc_targets)
             if has_lqc_targets:
