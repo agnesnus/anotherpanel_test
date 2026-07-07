@@ -32,9 +32,9 @@ from urllib.parse import quote
 # Persistent DB location:
 # 1) Use QC_STUDIO_DB_PATH env var if set
 # 2) Else default to a workspace-local file
-DB_PATH = Path(
-    os.getenv("QC_STUDIO_DB_PATH", str(Path(__file__).parent / "test_panel.db"))
-)
+# Keep DB inside this repo folder, regardless of launch directory
+REPO_ROOT = Path(__file__).resolve().parent
+DB_PATH = Path(os.getenv("QC_STUDIO_DB_PATH", str(REPO_ROOT / "test_panel.db"))).resolve()
 
 SAMPLE_TYPES = [
     {"type_code": "calibrator", "description": "Calibration standards (Cal 0 through Cal F)"},
