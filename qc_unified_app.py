@@ -163,23 +163,32 @@ class SampleInfo:
 
 def classify_sample(data_filename: str) -> SampleInfo:
     """Parse data filename into structured sample information."""
-    base = re.sub(r"(_P[12])?\.d$", "", data_filename)
+    # Robust normalize: trim, remove optional _P1/_P2 and .d (case-insensitive)
+    name = str(data_filename).strip()
+    base = re.sub(r"(_P[12])?\.d$", "", name, flags=re.IGNORECASE)
 
-    cal_match = re.match(r"^Cal\s+([0A-F])$", base)
+    cal_match = re.match(r"^Cal\s+([0A-F])$", base, flags=re.IGNORECASE)
     if cal_match:
-        return SampleInfo(data_filename=data_filename, sample_type="calibrator", calibrator_level=cal_match.group(1))
-
-    qc_match = re.match(r"^QC_(Low|High)(\d+)$", base)
-    if qc_match:
         return SampleInfo(
-            data_filename=data_filename, sample_type="qc",
-            qc_level=qc_match.group(1), qc_replicate=int(qc_match.group(2))
+            data_filename=data_filename,
+            sample_type="calibrator",
+            calibrator_level=cal_match.group(1).upper()
         )
 
-    if re.match(r"^Blank\d*$", base):
+    # ✅ robust QC parsing (handles QC_Low1, QC_High2, optional .d/_P1 in original name)
+    qc_match = re.match(r"^QC_(Low|High)\s*(\d+)$", base, flags=re.IGNORECASE)
+    if qc_match:
+        return SampleInfo(
+            data_filename=data_filename,
+            sample_type="qc",
+            qc_level=qc_match.group(1).capitalize(),   # "Low" / "High"
+            qc_replicate=int(qc_match.group(2))
+        )
+
+    if re.match(r"^Blank\d*$", base, flags=re.IGNORECASE):
         return SampleInfo(data_filename=data_filename, sample_type="blank")
 
-    if re.match(r"^(PBlank|PB)\d*$", base):
+    if re.match(r"^(PBlank|PB)\d*$", base, flags=re.IGNORECASE):
         return SampleInfo(data_filename=data_filename, sample_type="process_blank")
 
     eqa_match = re.match(r"^([A-Za-z]+)(\d{4})_(\d)([A-Z])-([a-z])$", base)
@@ -247,18 +256,24 @@ def classify_from_instrument_type(instrument_type: str, level: str, data_filenam
         return SampleInfo(data_filename=data_filename, sample_type="calibrator", calibrator_level=lvl)
 
     if itype == "QC":
-        qc_match = re.match(r"^QC_(Low|High)(\d+)", re.sub(r"(_P[12])?\.d$", "", data_filename))
-        qc_level = lvl if lvl else None
+        # ✅ same robust parsing as classify_sample
+        name = str(data_filename).strip()
+        base = re.sub(r"(_P[12])?\.d$", "", name, flags=re.IGNORECASE)
+        qc_match = re.match(r"^QC_(Low|High)\s*(\d+)$", base, flags=re.IGNORECASE)
+
+        qc_level = normalize_qc_level(lvl) if lvl else None
         qc_replicate = int(qc_match.group(2)) if qc_match else 1
         if qc_match and not qc_level:
-            qc_level = qc_match.group(1)
+            qc_level = qc_match.group(1).capitalize()
+
         return SampleInfo(
-            data_filename=data_filename, sample_type="qc",
-            qc_level=qc_level, qc_replicate=qc_replicate
+            data_filename=data_filename,
+            sample_type="qc",
+            qc_level=qc_level,
+            qc_replicate=qc_replicate
         )
 
     return classify_sample(data_filename)
-
 
 # ==============================================================================
 # DATABASE OPERATIONS
