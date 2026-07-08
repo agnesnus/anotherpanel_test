@@ -22,6 +22,7 @@ from typing import Optional
 from datetime import datetime
 import tempfile
 import os
+import shutil
 from io import BytesIO
 from urllib.parse import quote
 
