@@ -366,172 +366,156 @@ def ensure_db_initialized(db_path=None):
 # ==============================================================================
 # FORMAT DETECTION AND FILENAME PARSING
 # ==============================================================================
+# ==============================================================================
+# CSV IMPORTER — NEW FORMAT ONLY (Type/Level filtered)
+# ==============================================================================
 
-def detect_format(csv_path: str) -> str:
-    """Detect whether CSV is old or new format by checking header row."""
-    try:
-        df_header = pd.read_csv(csv_path, nrows=1, header=0)
-        second_row = df_header.iloc[0].tolist() if len(df_header) > 0 else []
-        second_row_strs = [str(v).strip() for v in second_row if pd.notna(v)]
-        if "Data Path" in second_row_strs:
-            return "new"
-    except Exception:
-        pass
-    return "old"
+def _normalize_colname(c: str) -> str:
+    c = str(c).strip().lower()
+    c = re.sub(r"[^a-z0-9]+", " ", c).strip()
+    return c
 
 
-def parse_filename_any(filepath: str) -> dict:
-    """Extract run metadata from any filename.
-    Tries several common patterns, then falls back to today's date / panel 1.
-    Accepts CSV, XLS, and XLSX files with any name.
+def _find_column_fuzzy(df_cols, aliases):
+    norm_to_real = {_normalize_colname(c): c for c in df_cols}
+    # exact normalized match first
+    for a in aliases:
+        a_norm = _normalize_colname(a)
+        if a_norm in norm_to_real:
+            return norm_to_real[a_norm]
+    # contains match fallback
+    for c in df_cols:
+        c_norm = _normalize_colname(c)
+        for a in aliases:
+            a_norm = _normalize_colname(a)
+            if a_norm in c_norm or c_norm in a_norm:
+                return c
+    return None
+
+
+def _require_columns(df, required_aliases_map):
+    missing = []
+    resolved = {}
+    for logical_name, aliases in required_aliases_map.items():
+        col = _find_column_fuzzy(df.columns, aliases)
+        if col is None:
+            missing.append(f"{logical_name} ({', '.join(aliases)})")
+        else:
+            resolved[logical_name] = col
+    if missing:
+        raise ValueError(
+            "CSV is missing required new-format columns:\n- " + "\n- ".join(missing)
+        )
+    return resolved
+
+
+def _extract_new_csv_structure(csv_path: str):
     """
-    basename = Path(filepath).name
+    Supports both common 'new' layouts:
+    1) Two-row header layout (row0 analyte '... Results', row1 metadata labels)
+    2) Single-row flat table with explicit columns.
+    Returns:
+      df_meta, analyte_columns (list of tuples: real_col_idx, analyte_name), col_map, first_data_path
+    """
+    # Try two-row style first
+    df_raw = pd.read_csv(csv_path, header=None)
+    if len(df_raw) >= 2:
+        row0 = [str(v).strip() if pd.notna(v) else "" for v in df_raw.iloc[0].tolist()]
+        row1 = [str(v).strip() if pd.notna(v) else "" for v in df_raw.iloc[1].tolist()]
 
-    # Pattern: 20260206_Panel1_conc(in).csv  (old format)
-    m = re.match(r"^(\d{8})_Panel(\d+)", basename)
-    if m:
-        date_str = m.group(1)
-        return {
-            "run_date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
-            "panel": int(m.group(2)),
-            "source_filename": basename,
-            "method_name": None,
-        }
+        analyte_cols = []
+        analyte_start_idx = None
+        for i, h in enumerate(row0):
+            if "results" in h.lower():
+                if analyte_start_idx is None:
+                    analyte_start_idx = i
+                analyte_name = normalize_analyte_name(re.sub(r"\s*results\s*$", "", h, flags=re.IGNORECASE).strip())
+                analyte_cols.append((i, analyte_name))
 
-    # Pattern: METHOD_20260420_P1(Sheet1).csv  (new format)
-    m = re.match(r"^(.+?)_(\d{8})_P(\d+)", basename)
-    if m:
-        date_str = m.group(2)
-        return {
-            "run_date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}",
-            "panel": int(m.group(3)),
-            "source_filename": basename,
-            "method_name": m.group(1),
-        }
+        if analyte_cols:
+            # Metadata region is row1 up to analyte_start_idx
+            meta_names = row1[:analyte_start_idx]
+            # Build a data frame with canonical metadata names + analyte numeric columns
+            records = []
+            for r in range(2, len(df_raw)):
+                row = df_raw.iloc[r].tolist()
+                records.append(row)
+            df_data = pd.DataFrame(records)
 
-    # Fallback: try to find any 8-digit date anywhere in the filename
-    date_match = re.search(r"(\d{8})", basename)
-    run_date = datetime.today().strftime("%Y-%m-%d")
-    if date_match:
-        d = date_match.group(1)
-        run_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+            # Resolve meta columns by position
+            meta_df = pd.DataFrame()
+            for i, name in enumerate(meta_names):
+                meta_df[name] = df_data.iloc[:, i] if i < df_data.shape[1] else np.nan
 
-    # Try to find panel number
-    panel_match = re.search(r"[Pp](?:anel)?(\d+)", basename)
-    panel = int(panel_match.group(1)) if panel_match else 1
+            # Add analyte columns by canonical names
+            for col_idx, analyte_name in analyte_cols:
+                if col_idx < df_data.shape[1]:
+                    meta_df[f"__ANALYTE__::{analyte_name}"] = df_data.iloc[:, col_idx]
+                else:
+                    meta_df[f"__ANALYTE__::{analyte_name}"] = np.nan
 
-    return {
-        "run_date": run_date,
-        "panel": panel,
-        "source_filename": basename,
-        "method_name": None,
-    }
-
-
-# Keep old names as aliases so nothing else breaks
-def parse_filename_old(filepath: str) -> dict:
-    return parse_filename_any(filepath)
-
-
-def parse_filename_new(filepath: str) -> dict:
-    return parse_filename_any(filepath)
-
-
-# ==============================================================================
-# CSV IMPORTER — OLD FORMAT
-# ==============================================================================
-
-def import_csv_old(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
-    """Import old-format CSV."""
-    ensure_db_initialized(db_path)
-    conn = get_connection(db_path)
-    cursor = conn.cursor()
-
-    uploaded_by = str(uploaded_by).strip().upper() if uploaded_by else None
-    meta = parse_filename_old(original_filename or csv_path)
-
-    cursor.execute("SELECT run_id FROM runs WHERE source_filename = ?", (meta["source_filename"],))
-    if cursor.fetchone():
-        return f"Already imported: {meta['source_filename']}"
-
-    cursor.execute(
-        "INSERT INTO runs (run_date, panel, source_filename, method_name, uploaded_by) VALUES (?, ?, ?, ?, ?)",
-        (meta["run_date"], meta["panel"], meta["source_filename"], meta["method_name"], uploaded_by)
-    )
-    run_id = cursor.lastrowid
-
-    df = pd.read_csv(csv_path, header=0)
-    df = df.iloc[1:].reset_index(drop=True)
-
-    analyte_columns = [normalize_analyte_name(col.replace(" Results", "").strip()) for col in df.columns[1:]]
-
-    analyte_id_map = {}
-    for i, name in enumerate(analyte_columns):
-        conn.execute(
-            "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
-            (name, meta["panel"], i + 1)
-        )
-        cursor.execute(
-            "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
-            (name,)
-        )
-        row = cursor.fetchone()
-        if row:
-            analyte_id_map[name] = row[0]
-
-    cursor.execute("SELECT type_code, type_id FROM sample_types")
-    type_map = dict(cursor.fetchall())
-
-    imported_count = 0
-    for _, row in df.iterrows():
-        data_filename = str(row.iloc[0]).strip()
-        if not data_filename or data_filename == "nan":
-            continue
-
-        info = classify_sample(data_filename)
-        sample_type_id = type_map[info.sample_type]
-
-        cursor.execute(
-            """INSERT INTO samples (
-                run_id, data_filename, sample_name, sample_type_id, instrument_type,
-                acquisition_datetime, autosampler_position, sample_group,
-                collection_date, patient_sequence,
-                calibrator_level, qc_level, qc_replicate,
-                eqa_scheme, eqa_year, eqa_round, eqa_sample_code, eqa_replicate
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, data_filename, None, sample_type_id, None, None, None, None,
-             info.collection_date, info.patient_sequence, info.calibrator_level, info.qc_level, info.qc_replicate,
-             info.eqa_scheme, info.eqa_year, info.eqa_round, info.eqa_sample_code, info.eqa_replicate)
-        )
-        sample_id = cursor.lastrowid
-
-        for i, analyte_name in enumerate(analyte_columns):
-            raw_value = row.iloc[i + 1]
-            concentration = None
-            if pd.notna(raw_value) and str(raw_value).strip() != "":
-                try:
-                    concentration = float(raw_value)
-                except ValueError:
-                    pass
-
-            cursor.execute(
-                "INSERT INTO results (sample_id, analyte_id, concentration) VALUES (?, ?, ?)",
-                (sample_id, analyte_id_map[analyte_name], concentration)
+            # Required metadata columns (fuzzy)
+            required = _require_columns(
+                meta_df,
+                {
+                    "type": ["Type"],
+                    "level": ["Level"],
+                    "data_file": ["Data File", "DataFile", "File", "Data Filename"],
+                    "data_path": ["Data Path", "DataPath", "Path"],
+                    "acq_datetime": ["Acq. Date-Time", "Acq Date-Time", "Acq Date Time", "Acquisition Date-Time", "Acquisition Datetime"],
+                },
             )
 
-        imported_count += 1
+            first_data_path = None
+            if required["data_path"] in meta_df.columns and len(meta_df) > 0:
+                first_val = meta_df[required["data_path"]].iloc[0]
+                first_data_path = str(first_val).strip() if pd.notna(first_val) and str(first_val).strip() else None
 
-    conn.commit()
-    conn.close()
-    return f"Imported {imported_count} samples from {meta['source_filename']}"
+            return (
+                meta_df,
+                [(c, c.replace("__ANALYTE__::", "")) for c in meta_df.columns if str(c).startswith("__ANALYTE__::")],
+                required,
+                first_data_path,
+            )
 
+    # Fallback: single header CSV
+    df = pd.read_csv(csv_path, header=0)
+    required = _require_columns(
+        df,
+        {
+            "type": ["Type"],
+            "level": ["Level"],
+            "data_file": ["Data File", "DataFile", "File", "Data Filename"],
+            "data_path": ["Data Path", "DataPath", "Path"],
+            "acq_datetime": ["Acq. Date-Time", "Acq Date-Time", "Acq Date Time", "Acquisition Date-Time", "Acquisition Datetime"],
+        },
+    )
 
-# ==============================================================================
-# CSV IMPORTER — NEW FORMAT
-# ==============================================================================
+    analyte_cols = []
+    for c in df.columns:
+        if "results" in str(c).lower():
+            analyte_name = normalize_analyte_name(re.sub(r"\s*results\s*$", "", str(c), flags=re.IGNORECASE).strip())
+            analyte_cols.append((c, analyte_name))
+
+    if not analyte_cols:
+        raise ValueError("CSV must contain analyte result columns (e.g., '<Analyte> Results').")
+
+    first_data_path = None
+    if len(df) > 0:
+        v = df[required["data_path"]].iloc[0]
+        first_data_path = str(v).strip() if pd.notna(v) and str(v).strip() else None
+
+    return df, analyte_cols, required, first_data_path
+
 
 def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
-    """Import new-format CSV with full metadata columns."""
+    """
+    Import new-format CSV ONLY.
+    Strict QC filter:
+      - Type must be QC
+      - Level must normalize to High/Low
+    Requires Acq Date-Time-like column.
+    """
     ensure_db_initialized(db_path)
     conn = get_connection(db_path)
     cursor = conn.cursor()
@@ -541,139 +525,129 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filen
 
     cursor.execute("SELECT run_id FROM runs WHERE source_filename = ?", (meta["source_filename"],))
     if cursor.fetchone():
+        conn.close()
         return f"Already imported: {meta['source_filename']}"
 
-    df_raw = pd.read_csv(csv_path, header=None)
+    df_data, analyte_cols, col_map, first_data_path = _extract_new_csv_structure(csv_path)
 
-    top_headers = df_raw.iloc[0].tolist()
-
-    analyte_start_idx = None
-    analyte_columns = []
-    for i, h in enumerate(top_headers):
-        h_str = str(h).strip() if pd.notna(h) else ""
-        if "Results" in h_str:
-            if analyte_start_idx is None:
-                analyte_start_idx = i
-            analyte_columns.append(normalize_analyte_name(h_str.replace(" Results", "").strip()))
-
-    if analyte_start_idx is None:
-        return "Error: Could not find analyte Results columns in CSV header"
-
-    sub_headers = df_raw.iloc[1].tolist()
-    meta_col_names = [str(v).strip() if pd.notna(v) else "" for v in sub_headers[:analyte_start_idx]]
-
-    def find_col(name):
-        for i, c in enumerate(meta_col_names):
-            if c == name:
-                return i
-        return None
-
-    col_name = find_col("Name")
-    col_data_file = find_col("Data File")
-    col_data_path = find_col("Data Path")
-    col_type = find_col("Type")
-    col_level = find_col("Level")
-    col_acq_datetime = find_col("Acq. Date-Time")
-    col_sample_group = find_col("Sample Group")
-    col_pos = find_col("Pos.")
-
-    first_data_path = None
-    if col_data_path is not None and len(df_raw) > 2:
-        first_data_path = str(df_raw.iloc[2, col_data_path]).strip() if pd.notna(df_raw.iloc[2, col_data_path]) else None
+    # Determine run_date from first valid acq datetime (fallback filename date)
+    run_date = None
+    for v in df_data[col_map["acq_datetime"]].tolist():
+        d = parse_date_value(v)
+        if d:
+            run_date = d
+            break
+    if run_date is None:
+        run_date = meta["run_date"]
 
     cursor.execute(
         "INSERT INTO runs (run_date, panel, source_filename, method_name, data_path, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)",
-        (meta["run_date"], meta["panel"], meta["source_filename"], meta["method_name"], first_data_path, uploaded_by)
+        (run_date, meta["panel"], meta["source_filename"], meta["method_name"], first_data_path, uploaded_by)
     )
     run_id = cursor.lastrowid
 
+    # analytes
     analyte_id_map = {}
-    for i, name in enumerate(analyte_columns):
+    for i, (_, analyte_name) in enumerate(analyte_cols):
         conn.execute(
             "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
-            (name, meta["panel"], i + 1)
+            (analyte_name, meta["panel"], i + 1)
         )
-        cursor.execute(
-            "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
-            (name,)
-        )
-        row = cursor.fetchone()
+        row = conn.execute(
+            "SELECT analyte_id FROM analytes WHERE lower(name)=lower(?) ORDER BY analyte_id LIMIT 1",
+            (analyte_name,)
+        ).fetchone()
         if row:
-            analyte_id_map[name] = row[0]
+            analyte_id_map[analyte_name] = row[0]
 
-    cursor.execute("SELECT type_code, type_id FROM sample_types")
-    type_map = dict(cursor.fetchall())
+    type_map = dict(conn.execute("SELECT type_code, type_id FROM sample_types").fetchall())
+    qc_type_id = type_map["qc"]
 
     imported_count = 0
-    for row_idx in range(2, len(df_raw)):
-        row = df_raw.iloc[row_idx]
+    skipped_non_qc = 0
 
-        data_filename = None
-        if col_data_file is not None:
-            val = row.iloc[col_data_file]
-            data_filename = str(val).strip() if pd.notna(val) else None
-
-        if not data_filename or data_filename == "nan":
+    for _, row in df_data.iterrows():
+        type_val = str(row[col_map["type"]]).strip() if pd.notna(row[col_map["type"]]) else ""
+        if type_val.lower() != "qc":
+            skipped_non_qc += 1
             continue
 
-        sample_name = str(row.iloc[col_name]).strip() if col_name is not None and pd.notna(row.iloc[col_name]) else None
-        instrument_type = str(row.iloc[col_type]).strip() if col_type is not None and pd.notna(row.iloc[col_type]) else None
-        level = str(row.iloc[col_level]).strip() if col_level is not None and pd.notna(row.iloc[col_level]) else None
-        acq_datetime = str(row.iloc[col_acq_datetime]).strip() if col_acq_datetime is not None and pd.notna(row.iloc[col_acq_datetime]) else None
-        sample_group = str(row.iloc[col_sample_group]).strip() if col_sample_group is not None and pd.notna(row.iloc[col_sample_group]) else None
-        position = str(row.iloc[col_pos]).strip() if col_pos is not None and pd.notna(row.iloc[col_pos]) else None
+        qc_level = normalize_qc_level(row[col_map["level"]])
+        if qc_level not in {"High", "Low"}:
+            continue
 
-        if instrument_type and instrument_type != "nan":
-            info = classify_from_instrument_type(instrument_type, level, data_filename)
-        else:
-            info = classify_sample(data_filename)
+        data_filename = str(row[col_map["data_file"]]).strip() if pd.notna(row[col_map["data_file"]]) else None
+        if not data_filename or data_filename.lower() == "nan":
+            continue
 
-        sample_type_id = type_map[info.sample_type]
+        acq_raw = row[col_map["acq_datetime"]]
+        acq_datetime = str(acq_raw).strip() if pd.notna(acq_raw) else None
+        collection_date = parse_date_value(acq_raw) or run_date
+
+        # replicate parsed from filename if possible
+        info = classify_sample(data_filename)
+        qc_replicate = info.qc_replicate if info.qc_replicate else 1
 
         cursor.execute(
-            """INSERT INTO samples (
+            """
+            INSERT INTO samples (
                 run_id, data_filename, sample_name, sample_type_id, instrument_type,
                 acquisition_datetime, autosampler_position, sample_group,
                 collection_date, patient_sequence,
                 calibrator_level, qc_level, qc_replicate,
                 eqa_scheme, eqa_year, eqa_round, eqa_sample_code, eqa_replicate
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, data_filename, sample_name, sample_type_id, instrument_type,
-             acq_datetime, position, sample_group, info.collection_date, info.patient_sequence,
-             info.calibrator_level, info.qc_level, info.qc_replicate,
-             info.eqa_scheme, info.eqa_year, info.eqa_round, info.eqa_sample_code, info.eqa_replicate)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                data_filename,
+                None,
+                qc_type_id,
+                "QC",
+                acq_datetime,
+                None,
+                None,
+                collection_date,
+                None,
+                None,
+                qc_level,
+                qc_replicate,
+                None, None, None, None, None
+            ),
         )
         sample_id = cursor.lastrowid
 
-        for i, analyte_name in enumerate(analyte_columns):
-            col_idx = analyte_start_idx + i
-            raw_value = row.iloc[col_idx] if col_idx < len(row) else None
+        # insert analyte results
+        for real_col, analyte_name in analyte_cols:
+            raw_value = row[real_col] if real_col in row.index else None
             concentration = None
             if pd.notna(raw_value) and str(raw_value).strip() != "":
                 try:
                     concentration = float(raw_value)
-                except ValueError:
-                    pass
+                except Exception:
+                    concentration = None
 
             cursor.execute(
                 "INSERT INTO results (sample_id, analyte_id, concentration) VALUES (?, ?, ?)",
-                (sample_id, analyte_id_map[analyte_name], concentration)
+                (sample_id, analyte_id_map[analyte_name], concentration),
             )
 
         imported_count += 1
 
     conn.commit()
     conn.close()
-    return f"Imported {imported_count} samples from {meta['source_filename']}"
+    return (
+        f"Imported {imported_count} QC samples from {meta['source_filename']}"
+        + (f" (skipped {skipped_non_qc} non-QC rows)" if skipped_non_qc else "")
+    )
 
 
 def import_csv(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
-    """Auto-detect format and import CSV."""
-    fmt = detect_format(csv_path)
-    if fmt == "old":
-        return import_csv_old(csv_path, db_path, uploaded_by, original_filename=original_filename)
-    else:
-        return import_csv_new(csv_path, db_path, uploaded_by, original_filename=original_filename)
+    """
+    New behavior: only accept new-format CSV with Type/Level/Acq Date-Time style columns.
+    """
+    return import_csv_new(csv_path, db_path=db_path, uploaded_by=uploaded_by, original_filename=original_filename)
+
 
 
 def normalize_qc_level(value):
@@ -787,12 +761,14 @@ def find_analyte_name_in_workbook(sheet_name, sample_row=None):
 
 
 def find_qc_summary_header_row(df):
-    for row_idx in range(min(len(df) - 1, 40)):
+    for row_idx in range(min(len(df) - 1, 60)):
         row_vec = df.iloc[row_idx].tolist()
         row_strs = [str(v).strip().lower() if pd.notna(v) else "" for v in row_vec]
-        if any("hqc" in s for s in row_strs) and any("lqc" in s for s in row_strs) and any(
-            token in s for s in row_strs for token in ["qc mean", "%cv", "+2sd", "-2sd"]
-        ):
+        has_qc = any("hqc" in s for s in row_strs) and any("lqc" in s for s in row_strs)
+        has_stats = any("qc mean" in s for s in row_strs) and (
+            any("+2sd" in s for s in row_strs) or any("-2sd" in s for s in row_strs)
+        )
+        if has_qc and has_stats:
             return row_idx, row_strs
     return None, None
 
