@@ -507,6 +507,29 @@ def _extract_new_csv_structure(csv_path: str):
 
     return df, analyte_cols, required, first_data_path
 
+def parse_filename_new(filename):
+    """
+    Parse source filename into metadata expected by import_csv_new.
+    Returns: dict with source_filename, run_date, panel, method_name
+    """
+    source_filename = Path(filename).name if filename else "uploaded.csv"
+    run_date = extract_date_from_filename(source_filename) or datetime.today().strftime("%Y-%m-%d")
+
+    # Optional panel extraction from filename like "...panel2..." or "...panel_2..."
+    panel = 1
+    m = re.search(r"panel[_\s-]?(\d+)", source_filename, flags=re.IGNORECASE)
+    if m:
+        try:
+            panel = int(m.group(1))
+        except Exception:
+            panel = 1
+
+    return {
+        "source_filename": source_filename,
+        "run_date": run_date,
+        "panel": panel,
+        "method_name": None,
+    }
 
 def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
     """
