@@ -1,185 +1,218 @@
 # QC Studio
 
-This project is a ready-made website template built with Streamlit.
+QC Studio is a Streamlit app for QC data import, target tracking, and charting.
 
-You can use it as a base and create a new website for a different project, even if you have never coded before.
-
----
-
-## What this app already does
-
-- Lets users upload files
-- Stores data in a local database
-- Shows charts and summaries
-- Exports results
-
-You can reuse this structure and replace the content with your own project topic.
+This guide shows:
+1. How to create a GitHub repository
+2. How to upload this project to GitHub
+3. How to run and deploy the app with Streamlit
+4. How to customize the code for your own panel (including replacing "test")
 
 ---
 
-## Before you start
+## Prerequisites
 
-You only need these things:
-
-1. A GitHub account
-2. A computer with internet
-3. Python installed (version 3.10 or newer is recommended)
-4. A text editor (VS Code is easiest)
+1. GitHub account
+2. Python installed (3.9+ recommended)
+3. VS Code (recommended)
 
 ---
 
-## Super Simple Plan
+## A) Create a New GitHub Repository
 
-1. Copy this project
-2. Change the app title and text
-3. Replace the data fields with your project fields
-4. Test locally
-5. Publish online
+### Option 1: Create repo on GitHub website
+
+1. Go to GitHub and click New repository.
+2. Enter a repo name (for example: qc-my-panel).
+3. Choose Private or Public.
+4. Click Create repository.
+
+### Option 2: Create from local folder with Git
+
+From the project folder, run:
+
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/<your-username>/<your-repo>.git
+git push -u origin main
+```
 
 ---
 
-## Step-by-step for complete beginners
+## B) Upload Existing Project Files to GitHub
 
-### Step 1: Copy this project to your own GitHub
+If you created an empty repo on GitHub first, upload these files:
 
-- Open this repository on GitHub
-- Click Use this template (or create a new repository and upload these files)
-- Give your new repository a name
+1. qc_unified_app.py
+2. requirements.txt
+3. README.md
 
-Now you have your own copy.
+### Upload using GitHub web UI
 
-### Step 2: Download your copy to your computer
+1. Open your new repository.
+2. Click Add file > Upload files.
+3. Drag and drop the files.
+4. Commit changes.
 
-If you know Git, clone it.
+### Upload using Git (recommended)
 
-If you do not know Git:
-- Click Code on GitHub
-- Click Download ZIP
-- Unzip it on your computer
+```bash
+git add .
+git commit -m "Upload QC Studio files"
+git push
+```
 
-### Step 3: Open the folder in VS Code
+---
 
-- Open VS Code
-- Choose File > Open Folder
-- Select your project folder
+## C) Run Streamlit Locally
 
-### Step 4: Install required packages
+In your project folder:
 
-Open the terminal in VS Code and run:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run qc_unified_app.py
+```
+
+Then open the URL shown in terminal, usually:
+
+http://localhost:8501
+
+---
+
+## D) Deploy from GitHub to Streamlit Community Cloud
+
+1. Push latest code to GitHub.
+2. Go to https://share.streamlit.io
+3. Sign in with GitHub.
+4. Click New app.
+5. Select repository, branch, and main file: qc_unified_app.py
+6. Click Deploy.
+
+---
+
+## E) Make It Specific to Your Panel
+
+If your panel is not "test", rename labels and defaults to your panel name.
+
+### Safe way to replace "test" across code
+
+1. In VS Code, open global Search and Replace.
+2. Search for:
+
+```text
+test
+```
+
+3. Replace with your panel name, for example:
+
+```text
+thyroid
+```
+
+4. Review each match before replacing (some words may be unrelated).
+
+### Also update these likely fields
+
+1. UI titles and captions
+2. Any default DB file names
+3. README project description
+4. Any old query parameter names in URLs
+5. Export labels (if they mention panel or hormone)
+
+### Verify after customization
+
+```bash
+python -m py_compile qc_unified_app.py
+streamlit run qc_unified_app.py
+```
+
+Check:
+1. Data import works
+2. Targets import works
+3. Dashboard charts render correctly
+4. Export and report still work
+
+---
+
+## F) Quick Update Workflow
+
+After edits:
+
+```bash
+git add .
+git commit -m "Panel customization updates"
+git push
+```
+
+If deployed on Streamlit Cloud, it will auto-redeploy from GitHub.
+
+---
+
+## G) Download or Delete the Database
+
+The app includes built-in database management in the Database page.
+
+### Download database (.db)
+
+1. Open the app.
+2. Go to the Database module.
+3. In Database File Management, click:
+
+```text
+Download current database (.db)
+```
+
+4. Save the file to your computer as a backup.
+
+### Delete/reset database from app UI
+
+1. Go to Database module.
+2. Open Danger Zone.
+3. Tick:
+
+```text
+I understand this cannot be undone.
+```
+
+4. Click:
+
+```text
+Delete database file and reset
+```
+
+This permanently removes all imported data from the local database file.
+
+### Delete database from terminal (optional)
+
+From the project folder:
+
+```bash
+rm -f test_panel.db
+```
+
+If you changed the DB path with QC_STUDIO_DB_PATH, delete that file path instead.
+
+---
+
+## Troubleshooting
+
+If something looks wrong:
+
+1. Re-check uploaded target values in the app
+2. Re-import files after parser changes
+3. Run compile check:
+
+```bash
+python -m py_compile qc_unified_app.py
+```
+
+4. Confirm required libraries are installed:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-### Step 5: Start the website locally
-
-Run:
-
-```bash
-streamlit run qc_unified_app.py
-```
-
-A browser page will open. This is your website running on your computer.
-
-### Step 6: Change the website text first
-
-In file qc_unified_app.py, change:
-- Main title
-- Section names
-- Help text
-
-This is the easiest first change and helps you learn the file layout.
-
-### Step 7: Replace project fields with your own
-
-This app currently uses QC terms like analyte, HQC, and LQC.
-
-For your project, replace these with your own terms.
-
-Example:
-- analyte -> product
-- qc_level -> category
-- concentration -> score
-
-Update in these areas:
-- Data lists near the top of the file
-- Table schema (database section)
-- Upload/import logic
-- Charts and report labels
-
-### Step 8: Keep what you do not need to rebuild
-
-You can keep these parts and just rename fields:
-- Upload flow
-- Database saving
-- Chart layout
-- Report table
-- CSV export
-
-This saves a lot of time.
-
-### Step 9: Test after each small change
-
-After edits, run:
-
-```bash
-python3 -m py_compile qc_unified_app.py
-streamlit run qc_unified_app.py
-```
-
-If the page opens and works, continue.
-
----
-
-## Publish your website online (easy method)
-
-Use Streamlit Community Cloud.
-
-1. Push your code to GitHub
-2. Go to share.streamlit.io
-3. Sign in with GitHub
-4. Click New app
-5. Choose your repository
-6. Set main file to qc_unified_app.py
-7. Click Deploy
-
-Your website is now online with a public link.
-
----
-
-## If you want to build a different project quickly
-
-Use this checklist:
-
-- [ ] Rename app title and sections
-- [ ] Replace data fields with your project fields
-- [ ] Update upload file format rules
-- [ ] Update chart labels and report columns
-- [ ] Test locally
-- [ ] Deploy to Streamlit Cloud
-
----
-
-## Common beginner tips
-
-- Change one thing at a time
-- Test after every change
-- Keep a backup copy before big edits
-- If something breaks, undo only your last small change
-
----
-
-## Need help
-
-If you get stuck, open an issue in the repository and include:
-- What you changed
-- The error message
-- A screenshot
-
-That makes troubleshooting much faster.
-
----
-
-## License
-
-See LICENSE.
