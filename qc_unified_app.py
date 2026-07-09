@@ -1,11 +1,11 @@
 """
 QC Studio — Unified Application
 ================================
-Integrated platform for test panel database management, QC data export, and dashboard visualization.
+Integrated platform for QC panel database management, QC data export, and dashboard visualization.
 
 Features:
-1. Test Panel Database: SQLite database for LC-MS/MS test panel results (built from uploaded files)
-2. QC Export: Export CSV files with HQC and LQC values for all hormones
+1. Panel Database: SQLite database for uploaded QC panel results
+2. QC Export: Export CSV files with HQC and LQC values for all analytes
 3. QC Dashboard: Interactive Levey-Jennings charts with 2SD/3SD bands
 
 """
@@ -740,18 +740,12 @@ def extract_date_from_filename(filename):
 
 
 def normalize_analyte_name(name):
-    """Return a canonical analyte display name to avoid duplicate aliases (e.g., DHEAS vs DHEA-S)."""
+    """Return a canonical analyte display name without panel-specific alias assumptions."""
     if pd.isna(name):
         return ""
     raw = str(name).strip()
-    key = re.sub(r"[^a-z0-9]", "", raw.lower())
-
-    alias_map = {
-        "dheas": "DHEA-S",
-        "dht": "DHT",
-        "dihydrotestosterone": "DHT",
-    }
-    return alias_map.get(key, raw)
+    # Normalize repeated whitespace but keep original analyte identity unchanged.
+    return re.sub(r"\s+", " ", raw)
 
 
 # Generic sheet names that should not be treated as analyte names
@@ -760,6 +754,29 @@ _EXCLUDED_SHEET_NAMES = {
     "summary", "data", "results", "targets", "overview",
     "template", "index", "contents", "",
 }
+
+
+def _normalize_sheet_key(sheet_name):
+    return re.sub(r"\s+", " ", str(sheet_name).strip().lower())
+
+
+_NON_ANALYTE_SHEET_KEYS = {
+    "index",
+    "tecan calibrants",
+    "tecan qc concentrations",
+    "summary",
+    "overview",
+    "targets",
+    "data",
+    "results",
+    "contents",
+    "template",
+    "",
+}
+
+
+def is_non_analyte_sheet(sheet_name):
+    return _normalize_sheet_key(sheet_name) in _NON_ANALYTE_SHEET_KEYS
 
 
 def find_analyte_name_in_workbook(sheet_name, sample_row=None):
@@ -807,9 +824,15 @@ def find_header_index(row_strs, tokens, start=0, end=None):
     return None
 
 
-def calculate_sd(mean, upper2=None, lower2=None, upper3=None, lower3=None, cv=None):
+def calculate_sd(mean, sd=None, upper2=None, lower2=None, upper3=None, lower3=None, cv=None):
     if mean is None or pd.isna(mean):
         return None
+
+    if sd is not None and not pd.isna(sd):
+        try:
+            return abs(float(sd))
+        except Exception:
+            pass
 
     if upper2 is not None and not pd.isna(upper2):
         try:
@@ -850,13 +873,240 @@ def parse_qc_targets_from_sheet(sheet_name, df, file_date):
         return []
     analyte = normalize_analyte_name(analyte)
 
+    def cell_text(v):
+        return str(v).strip().lower() if pd.notna(v) else ""
+
+    def label_contains(label, *tokens):
+        return all(t in label for t in tokens)
+
+    def collect_global_level_anchors():
+        anchors = {"hqc": [], "lqc": []}
+        for r in range(min(len(df), 80)):
+            row_vals = [cell_text(v) for v in df.iloc[r].tolist()]
+            for c_idx, lbl in enumerate(row_vals):
+                if not lbl:
+                    continue
+                if lbl == "hqc" or "hqc %cv" in lbl:
+                    anchors["hqc"].append(c_idx)
+                if lbl == "lqc" or "lqc %cv" in lbl:
+                    anchors["lqc"].append(c_idx)
+        anchors["hqc"] = sorted(set(anchors["hqc"]))
+        anchors["lqc"] = sorted(set(anchors["lqc"]))
+        return anchors
+
+    global_level_anchors = collect_global_level_anchors()
+
+    def collect_stat_candidates(header_row):
+        cols = {
+            "mean": [],
+            "sd": [],
+            "cv": [],
+            "plus2": [],
+            "minus2": [],
+            "plus3": [],
+            "minus3": [],
+        }
+        for idx, raw in enumerate(header_row):
+            label = cell_text(raw)
+            if not label:
+                continue
+            if "qc mean" in label or label == "mean":
+                cols["mean"].append(idx)
+            if "+2sd" in label or label_contains(label, "2sd", "ucl"):
+                cols["plus2"].append(idx)
+            if "-2sd" in label or label_contains(label, "2sd", "lcl"):
+                cols["minus2"].append(idx)
+            if "+3sd" in label or label_contains(label, "3sd", "ucl"):
+                cols["plus3"].append(idx)
+            if "-3sd" in label or label_contains(label, "3sd", "lcl"):
+                cols["minus3"].append(idx)
+            if "%cv" in label:
+                cols["cv"].append(idx)
+            if "sd" in label and all(k not in label for k in ["+2sd", "-2sd", "+3sd", "-3sd"]):
+                cols["sd"].append(idx)
+        return cols
+
+    def choose_col_for_section(candidates, anchor_col, left_bound, right_bound):
+        if not candidates:
+            return None
+        in_section = [c for c in candidates if left_bound <= c <= right_bound]
+        if not in_section:
+            return None
+        return min(in_section, key=lambda c: abs(c - anchor_col))
+
+    def select_stat_cols_for_anchor(candidate_cols, anchor_col, all_level_anchor_cols):
+        left_candidates = [c for c in all_level_anchor_cols if c < anchor_col]
+        right_candidates = [c for c in all_level_anchor_cols if c > anchor_col]
+        left_bound = (max(left_candidates) + 1) if left_candidates else 0
+        right_bound = (min(right_candidates) - 1) if right_candidates else 10**9
+        return {
+            key: choose_col_for_section(vals, anchor_col, left_bound, right_bound)
+            for key, vals in candidate_cols.items()
+        }
+
+    def first_numeric_from_row(row, idx):
+        if idx is None or idx >= len(row):
+            return None
+        try:
+            val = pd.to_numeric(pd.Series([row[idx]]), errors="coerce").iloc[0]
+            return None if pd.isna(val) else float(val)
+        except Exception:
+            return None
+
+    def pick_value_row(start_idx, stat_cols):
+        # First row under header that contains a numeric QC mean, else first row with >=2 numeric stat fields.
+        for r in range(start_idx + 1, min(start_idx + 6, len(df))):
+            row = df.iloc[r].tolist()
+            mean_val = first_numeric_from_row(row, stat_cols.get("mean"))
+            if mean_val is not None:
+                return row
+        for r in range(start_idx + 1, min(start_idx + 6, len(df))):
+            row = df.iloc[r].tolist()
+            num_count = 0
+            for key in ["sd", "plus2", "minus2", "plus3", "minus3", "cv"]:
+                if first_numeric_from_row(row, stat_cols.get(key)) is not None:
+                    num_count += 1
+            if num_count >= 2:
+                return row
+        return None
+
+    def parse_level_block(level_key, db_qc_level):
+        for r in range(min(len(df), 120)):
+            row_labels = [cell_text(v) for v in df.iloc[r].tolist()]
+            level_anchor_cols = [
+                idx for idx, lbl in enumerate(row_labels)
+                if level_key == lbl or level_key in lbl
+            ]
+            if not level_anchor_cols:
+                continue
+
+            # Prefer global anchors (banner/HQC%CV/LQC%CV rows) to define left/right section bounds.
+            all_anchor_cols = sorted(set(global_level_anchors["hqc"] + global_level_anchors["lqc"]))
+            if level_key in global_level_anchors and global_level_anchors[level_key]:
+                level_anchor_cols = sorted(set(level_anchor_cols + global_level_anchors[level_key]))
+
+            if len(global_level_anchors["hqc"]) and len(global_level_anchors["lqc"]):
+                # Hard split between HQC and LQC zones to avoid cross-binding columns.
+                split = (max(global_level_anchors["hqc"]) + min(global_level_anchors["lqc"])) / 2.0
+                if level_key == "hqc":
+                    level_anchor_cols = [c for c in level_anchor_cols if c <= split] or level_anchor_cols
+                    all_anchor_cols = [c for c in all_anchor_cols if c <= split] + [int(split)]
+                else:
+                    level_anchor_cols = [c for c in level_anchor_cols if c >= split] or level_anchor_cols
+                    all_anchor_cols = [int(split)] + [c for c in all_anchor_cols if c >= split]
+
+            if not all_anchor_cols:
+                all_anchor_cols = level_anchor_cols
+
+            # Header row is usually directly below level label, but scan a few rows down for flexibility.
+            for h in range(r + 1, min(r + 8, len(df))):
+                header = df.iloc[h].tolist()
+                header_labels = [cell_text(v) for v in header]
+                candidate_cols = collect_stat_candidates(header)
+                if not candidate_cols["mean"]:
+                    continue
+
+                # Determine local HQC/LQC block boundaries from this header row.
+                local_markers = []
+                for idx, lbl in enumerate(header_labels):
+                    if lbl == "hqc" or "hqc %cv" in lbl:
+                        local_markers.append((idx, "hqc"))
+                    if lbl == "lqc" or "lqc %cv" in lbl:
+                        local_markers.append((idx, "lqc"))
+                local_markers = sorted(local_markers, key=lambda x: x[0])
+
+                for anchor_col in level_anchor_cols:
+                    split = None
+                    if len(global_level_anchors["hqc"]) and len(global_level_anchors["lqc"]):
+                        split = (max(global_level_anchors["hqc"]) + min(global_level_anchors["lqc"])) / 2.0
+
+                    # Hard filter by level side first; prevents LQC from using HQC +2/+3 SD columns.
+                    filtered_candidates = candidate_cols
+                    if split is not None:
+                        if level_key == "hqc":
+                            filtered_candidates = {
+                                k: [c for c in vals if c <= split]
+                                for k, vals in candidate_cols.items()
+                            }
+                        else:
+                            filtered_candidates = {
+                                k: [c for c in vals if c >= split]
+                                for k, vals in candidate_cols.items()
+                            }
+
+                    # Prefer strict bounds from local markers so LQC cannot read HQC stats and vice versa.
+                    if local_markers:
+                        same_level = [m for m in local_markers if m[1] == level_key]
+                        if same_level:
+                            marker_col = min(same_level, key=lambda x: abs(x[0] - anchor_col))[0]
+                        else:
+                            marker_col = anchor_col
+
+                        right_markers = [m[0] for m in local_markers if m[0] > marker_col]
+                        left_markers = [m[0] for m in local_markers if m[0] < marker_col]
+                        left_bound = marker_col
+                        right_bound = (min(right_markers) - 1) if right_markers else (len(header) - 1)
+                        # If a previous marker exists, keep within current block span.
+                        if left_markers:
+                            left_bound = max(left_bound, max(left_markers) + 1)
+
+                        stat_cols = {
+                            key: choose_col_for_section(vals, anchor_col, left_bound, right_bound)
+                            for key, vals in filtered_candidates.items()
+                        }
+                    else:
+                        stat_cols = select_stat_cols_for_anchor(filtered_candidates, anchor_col, all_anchor_cols)
+
+                    if stat_cols["mean"] is None:
+                        continue
+                    if all(stat_cols[k] is None for k in ["sd", "plus2", "minus2", "plus3", "minus3", "cv"]):
+                        continue
+
+                    value_row = pick_value_row(h, stat_cols)
+                    if value_row is None:
+                        continue
+
+                    mean_val = first_numeric_from_row(value_row, stat_cols["mean"])
+                    sd_val = calculate_sd(
+                        mean_val,
+                        sd=first_numeric_from_row(value_row, stat_cols["sd"]),
+                        upper2=first_numeric_from_row(value_row, stat_cols["plus2"]),
+                        lower2=first_numeric_from_row(value_row, stat_cols["minus2"]),
+                        upper3=first_numeric_from_row(value_row, stat_cols["plus3"]),
+                        lower3=first_numeric_from_row(value_row, stat_cols["minus3"]),
+                        cv=first_numeric_from_row(value_row, stat_cols["cv"]),
+                    )
+                    if mean_val is None or sd_val is None or pd.isna(mean_val) or pd.isna(sd_val) or float(sd_val) == 0:
+                        continue
+
+                    return {
+                        "analyte": analyte,
+                        "qc_level": db_qc_level,
+                        "target_mean": float(mean_val),
+                        "target_sd": float(abs(sd_val)),
+                        "effective_from": file_date,
+                    }
+        return None
+
+    targets = []
+    hqc_target = parse_level_block("hqc", "High")
+    lqc_target = parse_level_block("lqc", "Low")
+    if hqc_target:
+        targets.append(hqc_target)
+    if lqc_target:
+        targets.append(lqc_target)
+
+    # Backward compatibility with older single-header layouts where HQC/LQC are on one row.
+    if targets:
+        return targets
+
     header_row_idx, header_row = find_qc_summary_header_row(df)
     if header_row_idx is None or header_row_idx + 1 >= len(df):
         return []
 
     value_row = df.iloc[header_row_idx + 1].tolist()
-    hqc_start = next((i for i, cell in enumerate(header_row) if "hqc" in cell and "%cv" in cell), None)
-    lqc_start = next((i for i, cell in enumerate(header_row) if "lqc" in cell and "%cv" in cell), None)
+    hqc_start = next((i for i, cell in enumerate(header_row) if "hqc" in cell), None)
+    lqc_start = next((i for i, cell in enumerate(header_row) if "lqc" in cell), None)
     if hqc_start is None or lqc_start is None:
         return []
 
@@ -864,55 +1114,40 @@ def parse_qc_targets_from_sheet(sheet_name, df, file_date):
     lqc_end = len(header_row)
 
     hqc_mean_col = find_header_index(header_row, ["qc mean"], start=hqc_start, end=hqc_end)
-    hqc_upper2_col = find_header_index(header_row, ["+2sd"], start=hqc_start, end=hqc_end)
-    hqc_lower2_col = find_header_index(header_row, ["-2sd"], start=hqc_start, end=hqc_end)
-    hqc_upper3_col = find_header_index(header_row, ["+3sd"], start=hqc_start, end=hqc_end)
-    hqc_lower3_col = find_header_index(header_row, ["-3sd"], start=hqc_start, end=hqc_end)
+    hqc_plus2_col = find_header_index(header_row, ["+2sd"], start=hqc_start, end=hqc_end)
+    hqc_minus2_col = find_header_index(header_row, ["-2sd"], start=hqc_start, end=hqc_end)
+    hqc_plus3_col = find_header_index(header_row, ["+3sd"], start=hqc_start, end=hqc_end)
+    hqc_minus3_col = find_header_index(header_row, ["-3sd"], start=hqc_start, end=hqc_end)
     hqc_cv_col = find_header_index(header_row, ["%cv"], start=hqc_start, end=hqc_end)
 
     lqc_mean_col = find_header_index(header_row, ["qc mean"], start=lqc_start, end=lqc_end)
-    lqc_upper2_col = find_header_index(header_row, ["+2sd"], start=lqc_start, end=lqc_end)
-    lqc_lower2_col = find_header_index(header_row, ["-2sd"], start=lqc_start, end=lqc_end)
-    lqc_upper3_col = find_header_index(header_row, ["+3sd"], start=lqc_start, end=lqc_end)
-    lqc_lower3_col = find_header_index(header_row, ["-3sd"], start=lqc_start, end=lqc_end)
+    lqc_plus2_col = find_header_index(header_row, ["+2sd"], start=lqc_start, end=lqc_end)
+    lqc_minus2_col = find_header_index(header_row, ["-2sd"], start=lqc_start, end=lqc_end)
+    lqc_plus3_col = find_header_index(header_row, ["+3sd"], start=lqc_start, end=lqc_end)
+    lqc_minus3_col = find_header_index(header_row, ["-3sd"], start=lqc_start, end=lqc_end)
     lqc_cv_col = find_header_index(header_row, ["%cv"], start=lqc_start, end=lqc_end)
 
-    targets = []
-    hqc_mean = value_row[hqc_mean_col] if hqc_mean_col is not None else None
-    hqc_sd = calculate_sd(
-        hqc_mean,
-        upper2=value_row[hqc_upper2_col] if hqc_upper2_col is not None else None,
-        lower2=value_row[hqc_lower2_col] if hqc_lower2_col is not None else None,
-        upper3=value_row[hqc_upper3_col] if hqc_upper3_col is not None else None,
-        lower3=value_row[hqc_lower3_col] if hqc_lower3_col is not None else None,
-        cv=value_row[hqc_cv_col] if hqc_cv_col is not None else None,
-    )
-    if hqc_sd is not None and hqc_mean is not None and not pd.isna(hqc_mean):
-        targets.append({
-            "analyte": analyte,
-            "qc_level": "High",
-            "target_mean": float(hqc_mean),
-            "target_sd": float(hqc_sd),
-            "effective_from": file_date,
-        })
-
-    lqc_mean = value_row[lqc_mean_col] if lqc_mean_col is not None else None
-    lqc_sd = calculate_sd(
-        lqc_mean,
-        upper2=value_row[lqc_upper2_col] if lqc_upper2_col is not None else None,
-        lower2=value_row[lqc_lower2_col] if lqc_lower2_col is not None else None,
-        upper3=value_row[lqc_upper3_col] if lqc_upper3_col is not None else None,
-        lower3=value_row[lqc_lower3_col] if lqc_lower3_col is not None else None,
-        cv=value_row[lqc_cv_col] if lqc_cv_col is not None else None,
-    )
-    if lqc_sd is not None and lqc_mean is not None and not pd.isna(lqc_mean):
-        targets.append({
-            "analyte": analyte,
-            "qc_level": "Low",
-            "target_mean": float(lqc_mean),
-            "target_sd": float(lqc_sd),
-            "effective_from": file_date,
-        })
+    for level, mean_col, p2_col, m2_col, p3_col, m3_col, cv_col in [
+        ("High", hqc_mean_col, hqc_plus2_col, hqc_minus2_col, hqc_plus3_col, hqc_minus3_col, hqc_cv_col),
+        ("Low", lqc_mean_col, lqc_plus2_col, lqc_minus2_col, lqc_plus3_col, lqc_minus3_col, lqc_cv_col),
+    ]:
+        mean_val = value_row[mean_col] if mean_col is not None else None
+        sd_val = calculate_sd(
+            mean_val,
+            upper2=value_row[p2_col] if p2_col is not None else None,
+            lower2=value_row[m2_col] if m2_col is not None else None,
+            upper3=value_row[p3_col] if p3_col is not None else None,
+            lower3=value_row[m3_col] if m3_col is not None else None,
+            cv=value_row[cv_col] if cv_col is not None else None,
+        )
+        if mean_val is not None and sd_val is not None and not pd.isna(mean_val) and not pd.isna(sd_val) and float(sd_val) != 0:
+            targets.append({
+                "analyte": analyte,
+                "qc_level": level,
+                "target_mean": float(mean_val),
+                "target_sd": float(abs(sd_val)),
+                "effective_from": file_date,
+            })
 
     return targets
 
@@ -942,8 +1177,39 @@ def parse_qc_run_rows_from_sheet(sheet_name, df):
     if len(result_cols) < 2:
         return []
 
-    hqc_result_col = result_cols[0]
-    lqc_result_col = result_cols[1]
+    def detect_result_level_cols():
+        # Try to map each RESULT column to HQC/LQC by nearest section marker.
+        section_markers = []
+        scan_start = max(0, header_row_idx - 8)
+        for r in range(scan_start, header_row_idx + 1):
+            row_vals = [str(v).strip().lower() if pd.notna(v) else "" for v in df.iloc[r].tolist()]
+            for c_idx, cell in enumerate(row_vals):
+                if cell == "hqc" or "hqc" in cell:
+                    section_markers.append((c_idx, "High"))
+                if cell == "lqc" or "lqc" in cell:
+                    section_markers.append((c_idx, "Low"))
+
+        if not section_markers:
+            return result_cols[0], result_cols[1]
+
+        def nearest_level(col_idx):
+            left = [m for m in section_markers if m[0] <= col_idx]
+            if left:
+                return max(left, key=lambda x: x[0])[1]
+            return min(section_markers, key=lambda x: abs(x[0] - col_idx))[1]
+
+        high_cols = [c for c in result_cols if nearest_level(c) == "High"]
+        low_cols = [c for c in result_cols if nearest_level(c) == "Low"]
+
+        h_col = high_cols[0] if high_cols else result_cols[0]
+        l_col = low_cols[0] if low_cols else (result_cols[1] if len(result_cols) > 1 else result_cols[0])
+        if h_col == l_col and len(result_cols) > 1:
+            # Final fallback to left/right split.
+            h_col = result_cols[0]
+            l_col = result_cols[1]
+        return h_col, l_col
+
+    hqc_result_col, lqc_result_col = detect_result_level_cols()
 
     records = []
     for row_idx in range(header_row_idx + 1, len(df)):
@@ -1017,7 +1283,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
           AND qt.qc_level = ?
           AND qt.effective_from <= ?
           AND (qt.effective_to IS NULL OR qt.effective_to >= ?)
-        ORDER BY qt.effective_from DESC
+                ORDER BY qt.effective_from DESC, qt.target_id DESC
         LIMIT 1
     """
     row = conn.execute(query, (analyte_name, qc_level, as_of_date, as_of_date)).fetchone()
@@ -1030,7 +1296,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
             WHERE lower(a.name) = lower(?)
               AND qt.qc_level = ?
               AND qt.effective_from <= ?
-            ORDER BY qt.effective_from DESC
+                        ORDER BY qt.effective_from DESC, qt.target_id DESC
             LIMIT 1
         """
         row = conn.execute(query2, (analyte_name, qc_level, as_of_date)).fetchone()
@@ -1043,7 +1309,7 @@ def get_qc_target(analyte_name, qc_level, as_of_date=None, db_path=None):
             JOIN analytes a ON qt.analyte_id = a.analyte_id
             WHERE lower(a.name) = lower(?)
               AND qt.qc_level = ?
-            ORDER BY qt.effective_from DESC
+                        ORDER BY qt.effective_from DESC, qt.target_id DESC
             LIMIT 1
         """
         row = conn.execute(query3, (analyte_name, qc_level)).fetchone()
@@ -1094,9 +1360,13 @@ def insert_qc_target(analyte_name, qc_level, target_mean, target_sd,
     )
     row = cursor.fetchone()
     if not row:
-        conn.close()
-        raise ValueError(f"Analyte '{analyte_name}' not found in database.")
-    analyte_id = row[0]
+        cursor.execute(
+            "INSERT INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
+            (analyte_name, 1, None)
+        )
+        analyte_id = cursor.lastrowid
+    else:
+        analyte_id = row[0]
 
     # Close the previously open-ended row for this analyte+level (set effective_to = effective_from - 1 day)
     cursor.execute("""
@@ -1129,137 +1399,55 @@ def import_tecan_qc_file(file_bytes, filename, db_path=None):
     except Exception as e:
         raise ValueError(f"Failed to read Excel file: {str(e)}")
     
-    # Skip non-analyte sheets
-    skip_sheets = {' INDEX', ' TECAN calibrants', ' TECAN QC concentrations'}
-    analyte_sheets = [s for s in xls.sheet_names if s not in skip_sheets]
+    # Skip clearly non-analyte sheets (robust to spacing/case differences)
+    analyte_sheets = [s for s in xls.sheet_names if not is_non_analyte_sheet(s)]
     
     if not analyte_sheets:
         return "No analyte sheets found in workbook."
     
     imported = 0
+    imported_from_summary = 0
     skipped_inconsistent = 0
+    skipped_no_summary = 0
     default_from = extract_date_from_filename(filename) or datetime.today().strftime("%Y-%m-%d")
     
     for sheet_name in analyte_sheets:
-        analyte_name = normalize_analyte_name(sheet_name.strip())
-        
         # Read the sheet
         df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None)
-        
-        # Look for the header row (row 13 in 0-indexed is row 12, but check around there)
-        header_row_idx = None
-        for idx in range(0, min(20, len(df))):
-            row_vals = df.iloc[idx].astype(str).str.lower()
-            if any('tecan' in str(v) for v in row_vals) and any('outlier' in str(v) for v in row_vals):
-                header_row_idx = idx
-                break
-        
-        if header_row_idx is None:
-            continue  # Skip if can't find header
-        
-        # Find column indices for HQC and LQC
-        header = df.iloc[header_row_idx].astype(str).str.lower()
 
-        # Detect explicit section markers (HQC/LQC) from rows above the header row.
-        # Then assign each data column to the nearest section marker to avoid HQC/LQC cross-mapping.
-        section_markers = []
-        section_scan_start = max(0, header_row_idx - 8)
-        for r in range(section_scan_start, header_row_idx):
-            row_vals = df.iloc[r].astype(str).str.strip().str.lower()
-            for c_idx, cell in enumerate(row_vals):
-                if cell == "hqc":
-                    section_markers.append((c_idx, "HQC"))
-                elif cell == "lqc":
-                    section_markers.append((c_idx, "LQC"))
+        analyte_name = find_analyte_name_in_workbook(
+            sheet_name,
+            sample_row=df.iloc[0].tolist() if len(df) > 0 else None
+        )
+        if analyte_name is None:
+            continue
+        analyte_name = normalize_analyte_name(analyte_name)
 
-        def resolve_section(col_idx):
-            if section_markers:
-                left_markers = [m for m in section_markers if m[0] <= col_idx]
-                if left_markers:
-                    # Use the nearest marker to the left in the sheet layout.
-                    return max(left_markers, key=lambda x: x[0])[1]
-                # Fallback: nearest marker by absolute distance.
-                return min(section_markers, key=lambda x: abs(x[0] - col_idx))[1]
-            # Final fallback only if markers are missing.
-            return "HQC" if col_idx < len(header) / 2 else "LQC"
-
-        # Find "Tecan Conc." and "Outlier filtered" columns and map each to HQC/LQC section.
-        tecan_cols = {}
-        outlier_cols = {}
-
-        for col_idx in range(len(header)):
-            h = header.iloc[col_idx]
-            if 'tecan' in h and 'conc' in h:
-                tecan_cols[resolve_section(col_idx)] = col_idx
-            elif 'outlier' in h and 'filter' in h:
-                outlier_cols[resolve_section(col_idx)] = col_idx
-        
-        # Extract and import HQC and LQC data
-        data_start = header_row_idx + 1
-        
-        for sheet_qc_level in ["HQC", "LQC"]:
-            if sheet_qc_level not in tecan_cols or sheet_qc_level not in outlier_cols:
-                continue
-            
-            tecan_col = tecan_cols[sheet_qc_level]
-            outlier_col = outlier_cols[sheet_qc_level]
-            
-            # Get the data rows (skip empty rows)
-            tecan_data = df.iloc[data_start:, tecan_col]
-            outlier_data = df.iloc[data_start:, outlier_col]
-            
-            # Convert to numeric, dropping NaN
-            tecan_numeric = pd.to_numeric(tecan_data, errors='coerce').dropna()
-            outlier_numeric = pd.to_numeric(outlier_data, errors='coerce').dropna()
-            
-            if len(outlier_numeric) == 0:
-                continue
-            
-            # Use QC mean/SD from outlier-filtered values so the target is stable and level-specific.
-            target_mean = float(outlier_numeric.mean())
-            target_sd = float(outlier_numeric.std(ddof=1)) if len(outlier_numeric) > 1 else float(outlier_numeric.std())
-            
-            if pd.isna(target_mean) or pd.isna(target_sd) or target_sd == 0:
-                continue
-            
-            # Convert HQC/LQC to High/Low for database storage (matches chart code)
-            db_qc_level = "High" if sheet_qc_level == "HQC" else "Low"
-            
-            # Sanity check against previous same-level target: if jump is too large, skip to avoid HQC/LQC mix-ups.
-            conn_chk = get_connection(db_path)
-            prev = conn_chk.execute(
-                """
-                SELECT qt.target_mean
-                FROM qc_targets qt
-                JOIN analytes a ON qt.analyte_id = a.analyte_id
-                WHERE lower(a.name) = lower(?)
-                  AND qt.qc_level = ?
-                  AND qt.effective_from < ?
-                ORDER BY qt.effective_from DESC
-                LIMIT 1
-                """,
-                (analyte_name, db_qc_level, default_from)
-            ).fetchone()
-            conn_chk.close()
-
-            if prev and prev[0] is not None and float(prev[0]) > 0:
-                prev_mean = float(prev[0])
-                relative_change = abs(target_mean - prev_mean) / prev_mean
-                # >60% jump is usually a sign of wrong section mapping for QC targets.
-                if relative_change > 0.60:
-                    skipped_inconsistent += 1
-                    continue
-
-            try:
-                insert_qc_target(
-                    analyte_name, db_qc_level, float(target_mean), float(target_sd),
-                    default_from, db_path=db_path
-                )
-                imported += 1
-            except Exception as e:
-                pass  # Skip individual errors
+        # Preferred path: use explicit target mean/SD from QC summary structure.
+        summary_targets = parse_qc_targets_from_sheet(sheet_name, df, default_from)
+        if summary_targets:
+            for target in summary_targets:
+                try:
+                    insert_qc_target(
+                        target["analyte"],
+                        target["qc_level"],
+                        float(target["target_mean"]),
+                        float(target["target_sd"]),
+                        target["effective_from"],
+                        db_path=db_path,
+                    )
+                    imported += 1
+                    imported_from_summary += 1
+                except Exception:
+                    pass
+        else:
+            skipped_no_summary += 1
 
     msg = f"Imported {imported} QC target(s) from Tecan format."
+    if imported:
+        msg += f" (summary-table based: {imported_from_summary})"
+    if skipped_no_summary:
+        msg += f" Skipped {skipped_no_summary} sheet(s) with no parseable HQC/LQC summary table."
     if skipped_inconsistent:
         msg += f" Skipped {skipped_inconsistent} target(s) due to large deviation from previous same-level target."
     return msg
@@ -1277,9 +1465,12 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
         # Try to detect if it's Tecan format (has sheet names with analyte names)
         try:
             xls = pd.ExcelFile(BytesIO(file_bytes))
-            if any('tecan' in s.lower() for s in xls.sheet_names) or len([s for s in xls.sheet_names if s not in {' INDEX', ' TECAN calibrants', ' TECAN QC concentrations'}]) > 5:
-                # Likely Tecan format
-                return import_tecan_qc_file(file_bytes, filename, db_path)
+            analyte_like_sheets = [s for s in xls.sheet_names if not is_non_analyte_sheet(s)]
+            if len(analyte_like_sheets) >= 2 or any("tecan" in s.lower() for s in xls.sheet_names):
+                # Likely workbook-style QC chart file: try dedicated parser first.
+                tecan_msg = import_tecan_qc_file(file_bytes, filename, db_path)
+                if not tecan_msg.startswith("Imported 0"):
+                    return tecan_msg
         except:
             pass
         
@@ -1300,8 +1491,8 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
 
     analyte_col = pick("analyte", "hormone", "compound", "name")
     level_col = pick("qc_level", "qc level", "level", "type")
-    mean_col = pick("target_mean", "target mean", "mean", "qc mean", "tecan conc")
-    sd_col = pick("target_sd", "target sd", "sd", "cv", "outlier filtered out")
+    mean_col = pick("target_mean", "target mean", "qc mean", "qc_mean")
+    sd_col = pick("target_sd", "target sd", "qc sd", "qc_sd", "sd")
     from_col = pick("effective_from", "effective from", "from", "date")
     to_col = pick("effective_to", "effective to", "to")
     lot_col = pick("lot_number", "lot number", "lot")
@@ -1313,9 +1504,9 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
     if not level_col:
         missing.append("qc_level (try: qc_level, qc level, level, type)")
     if not mean_col:
-        missing.append("target_mean (try: target_mean, target mean, mean, qc mean, tecan conc)")
+        missing.append("target_mean (try: target_mean, target mean, qc mean)")
     if not sd_col:
-        missing.append("target_sd (try: target_sd, target sd, sd, cv, outlier filtered out)")
+        missing.append("target_sd (try: target_sd, target sd, qc sd, sd)")
     
     if missing:
         available = ", ".join([f"'{c}'" for c in df.columns])
@@ -1503,18 +1694,18 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
 
     if qc_targets:
         for target in qc_targets:
-            cursor.execute(
-                "SELECT analyte_id FROM analytes WHERE lower(name) = lower(?) ORDER BY analyte_id LIMIT 1",
-                (target["analyte"],)
-            )
-            row = cursor.fetchone()
-            if not row:
-                continue
-            analyte_id = row[0]
-            cursor.execute(
-                "INSERT OR REPLACE INTO qc_targets (analyte_id, qc_level, lot_number, target_mean, target_sd, effective_from) VALUES (?, ?, ?, ?, ?, ?)",
-                (analyte_id, target["qc_level"], None, target["target_mean"], target["target_sd"], target["effective_from"])
-            )
+            try:
+                insert_qc_target(
+                    analyte_name=target["analyte"],
+                    qc_level=target["qc_level"],
+                    target_mean=float(target["target_mean"]),
+                    target_sd=float(target["target_sd"]),
+                    effective_from=target["effective_from"],
+                    db_path=db_path,
+                )
+            except Exception:
+                # Keep QC result import resilient even if one target row fails.
+                pass
 
     analyte_id_map = {}
     for record in records:
@@ -1600,6 +1791,35 @@ def get_qc_data(db_path=None):
     return df
 
 
+def get_qc_chart_data(db_path=None):
+    """Pull raw QC points (no date averaging) for dashboard charting."""
+    db_path = db_path or DB_PATH
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    conn = get_connection(db_path)
+    query = """
+        SELECT
+            COALESCE(s.collection_date, substr(s.acquisition_datetime, 1, 10), r.run_date) AS run_date,
+            a.name as analyte,
+            s.qc_level,
+            r.uploaded_by,
+            s.sample_id,
+            res.concentration
+        FROM results res
+        JOIN samples s ON res.sample_id = s.sample_id
+        JOIN runs r ON s.run_id = r.run_id
+        JOIN analytes a ON res.analyte_id = a.analyte_id
+        JOIN sample_types st ON s.sample_type_id = st.type_id
+        WHERE st.type_code = 'qc'
+          AND res.concentration IS NOT NULL
+        ORDER BY a.name, s.qc_level, COALESCE(s.collection_date, substr(s.acquisition_datetime, 1, 10), r.run_date), s.sample_id
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
 def query_run_summary(db_path=None):
     """Get summary of all runs."""
     db_path = db_path or DB_PATH
@@ -1636,8 +1856,8 @@ def format_date(date_str):
     return f"{parts[2]}/{parts[1]}/{parts[0]}"
 
 
-def export_hormone_csv(analyte_name, hqc_data, lqc_data):
-    """Create CSV data for one hormone with HQC and LQC side by side."""
+def export_analyte_csv(analyte_name, hqc_data, lqc_data):
+    """Create CSV data for one analyte with HQC and LQC side by side."""
     hqc_mean = hqc_data["concentration"].mean() if not hqc_data.empty else np.nan
     hqc_sd = hqc_data["concentration"].std() if len(hqc_data) > 1 else np.nan
 
@@ -1731,37 +1951,40 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
 
     fig = go.Figure()
 
+    # Keep each point in table order, even when dates repeat.
+    x_pos = list(range(len(dates)))
+
     # Step reference lines (change at each effective date)
     fig.add_trace(go.Scatter(
-        x=dates, y=pp_mean,
+        x=x_pos, y=pp_mean,
         mode="lines",
         line=dict(color="#008000", dash="dash", width=2, shape="hv"),
         name="Mean",
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=dates, y=pp_sd2_u,
+        x=x_pos, y=pp_sd2_u,
         mode="lines",
         line=dict(color="#ff9800", dash="dot", width=1, shape="hv"),
         name="+2SD",
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=dates, y=pp_sd2_l,
+        x=x_pos, y=pp_sd2_l,
         mode="lines",
         line=dict(color="#ff9800", dash="dot", width=1, shape="hv"),
         name="-2SD",
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=dates, y=pp_sd3_u,
+        x=x_pos, y=pp_sd3_u,
         mode="lines",
         line=dict(color="#ff3d00", dash="dash", width=1, shape="hv"),
         name="+3SD",
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=dates, y=pp_sd3_l,
+        x=x_pos, y=pp_sd3_l,
         mode="lines",
         line=dict(color="#ff3d00", dash="dash", width=1, shape="hv"),
         name="-3SD",
@@ -1770,12 +1993,12 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
 
     # Per-point hover data includes that point's active mean/SD
     customdata_main = [
-        [ini, pm, psu, psl, pu3, pl3]
-        for ini, pm, psu, psl, pu3, pl3
-        in zip(initials_list, pp_mean, pp_sd2_u, pp_sd2_l, pp_sd3_u, pp_sd3_l)
+        [ini, pm, psu, psl, pu3, pl3, d]
+        for ini, pm, psu, psl, pu3, pl3, d
+        in zip(initials_list, pp_mean, pp_sd2_u, pp_sd2_l, pp_sd3_u, pp_sd3_l, dates)
     ]
     fig.add_trace(go.Scatter(
-        x=dates,
+        x=x_pos,
         y=concentrations,
         mode="lines+markers",
         marker=dict(size=9, color="#1976d2"),
@@ -1783,7 +2006,7 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
         name="Concentration",
         customdata=customdata_main,
         hovertemplate=(
-            "Date: %{x}<br>"
+            "Date: %{customdata[6]}<br>"
             "Concentration: %{y:.3f}<br>"
             "Initials: %{customdata[0]}<br>"
             "Mean: %{customdata[1]:.3f}<br>"
@@ -1794,7 +2017,7 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
         ),
     ))
 
-    flagged_dates = [d for d, f in zip(dates, flags) if f]
+    flagged_dates = [x for x, f in zip(x_pos, flags) if f]
     flagged_concs = [c for c, f in zip(concentrations, flags) if f]
     flagged_initials = [ini for ini, f in zip(initials_list, flags) if f]
     flagged_custom = [cd for cd, f in zip(customdata_main, flags) if f]
@@ -1807,7 +2030,7 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
             name="Flagged",
             customdata=flagged_custom,
             hovertemplate=(
-                "Date: %{x}<br>"
+                "Date: %{customdata[6]}<br>"
                 "Concentration: %{y:.3f}<br>"
                 "Initials: %{customdata[0]}<br>"
                 "Mean: %{customdata[1]:.3f}<br>"
@@ -1834,6 +2057,9 @@ def make_qc_chart(dates, concentrations, mean_val, sd2_upper, sd2_lower, sd3_upp
         showgrid=True,
         gridcolor="rgba(200,200,200,0.3)",
         zeroline=False,
+        tickmode="array",
+        tickvals=x_pos,
+        ticktext=dates,
         tickangle=-45,
         title_standoff=10,
     )
@@ -1914,7 +2140,7 @@ def create_value_pictogram(concentrations, mean_val, sd_val):
 
 
 def generate_final_report(db_path=None):
-    """Generate comprehensive QC report for all hormones."""
+    """Generate comprehensive QC report for all analytes."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
         return None
@@ -1928,14 +2154,14 @@ def generate_final_report(db_path=None):
     
     for analyte in analytes:
         analyte_data = df_qc[df_qc["analyte"] == analyte]
-        dashboard_url = f"?mode=Dashboard&hormone={quote(str(analyte))}"
+        dashboard_url = f"?mode=Dashboard&analyte={quote(str(analyte))}"
         
         for qc_level in ["High", "Low"]:
             level_data = analyte_data[analyte_data["qc_level"] == qc_level].reset_index(drop=True)
             
             if level_data.empty:
                 report_data.append({
-                    "Hormone": analyte,
+                    "Analyte": analyte,
                     "Go to Dashboard": dashboard_url,
                     "QC Level": "HQC" if qc_level == "High" else "LQC",
                     "Pictogram": create_value_pictogram([], 0.0, 0.0),
@@ -1973,7 +2199,7 @@ def generate_final_report(db_path=None):
                     status = "✓ OK (within 2 SD)"
             
             report_data.append({
-                "Hormone": analyte,
+                "Analyte": analyte,
                 "Go to Dashboard": dashboard_url,
                 "QC Level": "HQC" if qc_level == "High" else "LQC",
                 "Pictogram": create_value_pictogram(concentrations, mean_val, sd),
@@ -1995,7 +2221,7 @@ def generate_final_report(db_path=None):
 def main():
     st.set_page_config(page_title="QC Studio", layout="wide")
     st.title("🧪 QC Studio")
-    st.markdown("Integrated test panel database, QC export, and dashboard platform")
+    st.markdown("Integrated QC panel database, QC export, and dashboard platform")
     st.sidebar.caption(f"DB: {DB_PATH}")
 
     # Sidebar navigation
@@ -2014,7 +2240,7 @@ def main():
     st.sidebar.markdown(f"**Database:** `{DB_PATH.name}`")
 
     if mode == "Database":
-        st.header("📊 Steroid Panel Database")
+        st.header("📊 QC Panel Database")
 
         st.info("💡 **How it works:** Upload CSV or Excel files to automatically create and populate the database. The schema and reference data are generated on-demand from your first file upload.")
 
@@ -2066,7 +2292,7 @@ def main():
 
         st.markdown("---")
         st.subheader("🎯 QC Targets Manager")
-        st.markdown("View existing mean/SD targets per hormone and add new ones when lot changes.")
+        st.markdown("View existing mean/SD targets per analyte and add new ones when lot changes.")
 
         df_targets = get_all_qc_targets()
         if df_targets.empty:
@@ -2114,7 +2340,7 @@ def main():
                     all_analyte_names = ["— no analytes —"]
                 t_col1, t_col2 = st.columns(2)
                 with t_col1:
-                    t_analyte = st.selectbox("Hormone", all_analyte_names, key="t_analyte")
+                    t_analyte = st.selectbox("Analyte", all_analyte_names, key="t_analyte")
                     t_level   = st.selectbox("QC Level", ["High (HQC)", "Low (LQC)"], key="t_level")
                     t_lot     = st.text_input("Lot Number (optional)", key="t_lot")
                 with t_col2:
@@ -2154,8 +2380,8 @@ def main():
 
         analytes = sorted(df_qc["analyte"].unique())
 
-        st.subheader("Export Hormone CSVs")
-        st.markdown("Generate CSV files with HQC and LQC values for all hormones.")
+        st.subheader("Export Analyte CSVs")
+        st.markdown("Generate CSV files with HQC and LQC values for all analytes.")
 
         if st.button("📥 Generate All CSV Files", use_container_width=True):
             exported = []
@@ -2170,7 +2396,7 @@ def main():
                     if hqc_data.empty and lqc_data.empty:
                         continue
 
-                    df_export = export_hormone_csv(analyte, hqc_data, lqc_data)
+                    df_export = export_analyte_csv(analyte, hqc_data, lqc_data)
                     export_path = Path(temp_dir) / f"{analyte}_QC.csv"
                     df_export.to_csv(export_path, index=False)
                     exported.append((analyte, export_path))
@@ -2194,20 +2420,27 @@ def main():
             st.error("Database not found. Import data first in the Database tab.")
             return
 
-        df = get_qc_data()
+        df = get_qc_chart_data()
         if df.empty:
             st.warning("No QC data found in the database. Import data to view charts.")
             return
 
         analytes = sorted(df["analyte"].unique())
-        query_hormone = str(st.query_params.get("hormone", "")).strip()
-        default_hormone_idx = analytes.index(query_hormone) if query_hormone in analytes else 0
-        selected = st.sidebar.radio("Select Hormone", analytes, index=default_hormone_idx)
-        st.query_params["hormone"] = selected
+        query_analyte = str(st.query_params.get("analyte", "")).strip()
+        if not query_analyte:
+            # Backward compatibility for existing shared links.
+            query_analyte = str(st.query_params.get("hormone", "")).strip()
+        default_analyte_idx = analytes.index(query_analyte) if query_analyte in analytes else 0
+        selected = st.sidebar.radio("Select Analyte", analytes, index=default_analyte_idx)
+        st.query_params["analyte"] = selected
 
         analyte_data = df[df["analyte"] == selected]
         hqc_data = analyte_data[analyte_data["qc_level"] == "High"].reset_index(drop=True)
         lqc_data = analyte_data[analyte_data["qc_level"] == "Low"].reset_index(drop=True)
+        hqc_target_mean = None
+        hqc_target_sd = None
+        lqc_target_mean = None
+        lqc_target_sd = None
 
         chart_cols = st.columns(2)
 
@@ -2224,17 +2457,56 @@ def main():
             hqc_targets = get_per_date_targets(selected, "High", hqc_raw_dates)
             has_targets = any(t is not None for t in hqc_targets)
             if has_targets:
-                hqc_means = [float(t["target_mean"]) if t else hqc_data["concentration"].mean() for t in hqc_targets]
-                hqc_sds   = [float(t["target_sd"])   if t else hqc_data["concentration"].std()  for t in hqc_targets]
-                hqc_mean_val = hqc_means[-1]; hqc_sd = hqc_sds[-1]
-                chart_cols[0].caption("Mean/SD step-lines follow active QC targets per run date.")
-            else:
-                hqc_mean_val = hqc_data["concentration"].mean()
-                hqc_sd = hqc_data["concentration"].std()
-                hqc_means = None; hqc_sds = None
+                fallback_hqc_target = get_qc_target(selected, "High", as_of_date=max(hqc_raw_dates))
+                fallback_hqc_mean = float(fallback_hqc_target["target_mean"]) if fallback_hqc_target else None
+                fallback_hqc_sd = float(fallback_hqc_target["target_sd"]) if fallback_hqc_target else None
 
-            if pd.isna(hqc_sd) or hqc_sd == 0:
-                chart_cols[0].warning(f"Not enough HQC data points for {selected} to compute SD.")
+                hqc_means = [
+                    float(t["target_mean"]) if t else fallback_hqc_mean
+                    for t in hqc_targets
+                ]
+                hqc_sds = [
+                    float(t["target_sd"]) if t else fallback_hqc_sd
+                    for t in hqc_targets
+                ]
+
+                if any(v is None for v in hqc_means) or any(v is None for v in hqc_sds):
+                    chart_cols[0].warning(
+                        f"HQC target rows are missing for some dates of {selected}. "
+                        "Import complete QC target table values (QC mean + SD) for this analyte."
+                    )
+                    hqc_means = None
+                    hqc_sds = None
+                    hqc_mean_val = None
+                    hqc_sd = None
+                else:
+                    hqc_mean_val = hqc_means[-1]
+                    hqc_sd = hqc_sds[-1]
+                    hqc_target_mean = hqc_mean_val
+                    hqc_target_sd = hqc_sd
+                    chart_cols[0].caption("Chart lines use HQC summary-table targets (QC mean and SD bands) active per run date.")
+            else:
+                latest_hqc_target = get_qc_target(selected, "High", as_of_date=max(hqc_raw_dates))
+                if latest_hqc_target:
+                    hqc_mean_val = float(latest_hqc_target["target_mean"])
+                    hqc_sd = float(latest_hqc_target["target_sd"])
+                    hqc_means = [hqc_mean_val] * len(hqc_raw_dates)
+                    hqc_sds = [hqc_sd] * len(hqc_raw_dates)
+                    hqc_target_mean = hqc_mean_val
+                    hqc_target_sd = hqc_sd
+                    chart_cols[0].caption("Chart lines use stored HQC QC mean and SD target values.")
+                else:
+                    hqc_mean_val = None
+                    hqc_sd = None
+                    hqc_means = None
+                    hqc_sds = None
+                    chart_cols[0].warning(
+                        f"No HQC QC target table values found for {selected}. "
+                        "Chart reference lines require QC mean and SD from uploaded table."
+                    )
+
+            if hqc_sd is None or pd.isna(hqc_sd) or hqc_sd == 0:
+                chart_cols[0].warning(f"HQC target SD is missing/invalid for {selected}.")
             else:
                 hqc_fig = make_qc_chart(
                     hqc_dates, hqc_concentrations,
@@ -2263,17 +2535,56 @@ def main():
             lqc_targets = get_per_date_targets(selected, "Low", lqc_raw_dates)
             has_lqc_targets = any(t is not None for t in lqc_targets)
             if has_lqc_targets:
-                lqc_means = [float(t["target_mean"]) if t else lqc_data["concentration"].mean() for t in lqc_targets]
-                lqc_sds   = [float(t["target_sd"])   if t else lqc_data["concentration"].std()  for t in lqc_targets]
-                lqc_mean_val = lqc_means[-1]; lqc_sd = lqc_sds[-1]
-                chart_cols[1].caption("Mean/SD step-lines follow active QC targets per run date.")
-            else:
-                lqc_mean_val = lqc_data["concentration"].mean()
-                lqc_sd = lqc_data["concentration"].std()
-                lqc_means = None; lqc_sds = None
+                fallback_lqc_target = get_qc_target(selected, "Low", as_of_date=max(lqc_raw_dates))
+                fallback_lqc_mean = float(fallback_lqc_target["target_mean"]) if fallback_lqc_target else None
+                fallback_lqc_sd = float(fallback_lqc_target["target_sd"]) if fallback_lqc_target else None
 
-            if pd.isna(lqc_sd) or lqc_sd == 0:
-                chart_cols[1].warning(f"Not enough LQC data points for {selected} to compute SD.")
+                lqc_means = [
+                    float(t["target_mean"]) if t else fallback_lqc_mean
+                    for t in lqc_targets
+                ]
+                lqc_sds = [
+                    float(t["target_sd"]) if t else fallback_lqc_sd
+                    for t in lqc_targets
+                ]
+
+                if any(v is None for v in lqc_means) or any(v is None for v in lqc_sds):
+                    chart_cols[1].warning(
+                        f"LQC target rows are missing for some dates of {selected}. "
+                        "Import complete QC target table values (QC mean + SD) for this analyte."
+                    )
+                    lqc_means = None
+                    lqc_sds = None
+                    lqc_mean_val = None
+                    lqc_sd = None
+                else:
+                    lqc_mean_val = lqc_means[-1]
+                    lqc_sd = lqc_sds[-1]
+                    lqc_target_mean = lqc_mean_val
+                    lqc_target_sd = lqc_sd
+                    chart_cols[1].caption("Chart lines use LQC summary-table targets (QC mean and SD bands) active per run date.")
+            else:
+                latest_lqc_target = get_qc_target(selected, "Low", as_of_date=max(lqc_raw_dates))
+                if latest_lqc_target:
+                    lqc_mean_val = float(latest_lqc_target["target_mean"])
+                    lqc_sd = float(latest_lqc_target["target_sd"])
+                    lqc_means = [lqc_mean_val] * len(lqc_raw_dates)
+                    lqc_sds = [lqc_sd] * len(lqc_raw_dates)
+                    lqc_target_mean = lqc_mean_val
+                    lqc_target_sd = lqc_sd
+                    chart_cols[1].caption("Chart lines use stored LQC QC mean and SD target values.")
+                else:
+                    lqc_mean_val = None
+                    lqc_sd = None
+                    lqc_means = None
+                    lqc_sds = None
+                    chart_cols[1].warning(
+                        f"No LQC QC target table values found for {selected}. "
+                        "Chart reference lines require QC mean and SD from uploaded table."
+                    )
+
+            if lqc_sd is None or pd.isna(lqc_sd) or lqc_sd == 0:
+                chart_cols[1].warning(f"LQC target SD is missing/invalid for {selected}.")
             else:
                 lqc_fig = make_qc_chart(
                     lqc_dates, lqc_concentrations,
@@ -2296,20 +2607,36 @@ def main():
         if not hqc_data.empty:
             with stats_cols[0]:
                 st.subheader("HQC Statistics")
-                st.metric("HQC Mean", f"{hqc_data['concentration'].mean():.4f}")
-                st.metric("HQC SD", f"{hqc_data['concentration'].std():.4f}")
+                if hqc_target_mean is not None and hqc_target_sd is not None:
+                    st.metric("HQC QC Mean (Target)", f"{hqc_target_mean:.4f}")
+                    st.metric("HQC SD (Target)", f"{hqc_target_sd:.4f}")
+                    st.metric("HQC +2SD", f"{(hqc_target_mean + 2 * hqc_target_sd):.4f}")
+                    st.metric("HQC -2SD", f"{(hqc_target_mean - 2 * hqc_target_sd):.4f}")
+                    st.metric("HQC +3SD", f"{(hqc_target_mean + 3 * hqc_target_sd):.4f}")
+                    st.metric("HQC -3SD", f"{(hqc_target_mean - 3 * hqc_target_sd):.4f}")
+                else:
+                    st.metric("HQC QC Mean (Target)", "N/A")
+                    st.metric("HQC SD (Target)", "N/A")
                 st.metric("HQC Min", f"{hqc_data['concentration'].min():.4f}")
                 st.metric("HQC Max", f"{hqc_data['concentration'].max():.4f}")
 
         if not lqc_data.empty:
             with stats_cols[1]:
                 st.subheader("LQC Statistics")
-                st.metric("LQC Mean", f"{lqc_data['concentration'].mean():.4f}")
-                st.metric("LQC SD", f"{lqc_data['concentration'].std():.4f}")
+                if lqc_target_mean is not None and lqc_target_sd is not None:
+                    st.metric("LQC QC Mean (Target)", f"{lqc_target_mean:.4f}")
+                    st.metric("LQC SD (Target)", f"{lqc_target_sd:.4f}")
+                    st.metric("LQC +2SD", f"{(lqc_target_mean + 2 * lqc_target_sd):.4f}")
+                    st.metric("LQC -2SD", f"{(lqc_target_mean - 2 * lqc_target_sd):.4f}")
+                    st.metric("LQC +3SD", f"{(lqc_target_mean + 3 * lqc_target_sd):.4f}")
+                    st.metric("LQC -3SD", f"{(lqc_target_mean - 3 * lqc_target_sd):.4f}")
+                else:
+                    st.metric("LQC QC Mean (Target)", "N/A")
+                    st.metric("LQC SD (Target)", "N/A")
                 st.metric("LQC Min", f"{lqc_data['concentration'].min():.4f}")
                 st.metric("LQC Max", f"{lqc_data['concentration'].max():.4f}")
 
-        st.caption("Select a different hormone from the sidebar list.")
+        st.caption("Select a different analyte from the sidebar list.")
 
     elif mode == "Report":
         st.header("📋 QC Final Report")
@@ -2323,7 +2650,7 @@ def main():
             st.info("No QC data found in the database.")
             return
         
-        st.markdown("**Summary of all hormones with LQC and HQC values**")
+        st.markdown("**Summary of all analytes with LQC and HQC values**")
         
         # Display as a table with styling
         st.dataframe(
@@ -2331,7 +2658,7 @@ def main():
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Hormone": st.column_config.TextColumn("Hormone", width="medium"),
+                "Analyte": st.column_config.TextColumn("Analyte", width="medium"),
                 "Go to Dashboard": st.column_config.LinkColumn("Open Dashboard", width="small", display_text="Open"),
                 "QC Level": st.column_config.TextColumn("QC Level", width="small"),
                 "Pictogram": st.column_config.ImageColumn("Pictogram", width="medium"),
