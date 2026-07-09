@@ -199,6 +199,100 @@ If you changed the DB path with QC_STUDIO_DB_PATH, delete that file path instead
 
 ---
 
+## H) What Files Can Be Uploaded?
+
+The app has 2 upload areas in the Database module:
+
+1. Import QC Data (builds database samples/results and charts)
+2. Upload Mean/SD Targets File (stores QC mean and SD target lines)
+
+### 1) Import QC Data (CSV or Excel)
+
+Accepted file types:
+
+1. .csv
+2. .xls
+3. .xlsx
+
+#### CSV format (required fields)
+
+Your CSV should include metadata columns:
+
+1. Type
+2. Level
+3. Data File
+4. Data Path
+5. Acq. Date-Time (or equivalent acquisition datetime label)
+
+And analyte result columns named like:
+
+```text
+<Analyte Name> Results
+```
+
+Notes:
+
+1. Type should be QC for rows to be imported as QC samples.
+2. Level should map to High/HQC or Low/LQC.
+
+#### Excel format (supported patterns)
+
+Pattern A: Workbook with one sheet per analyte.
+
+Each analyte sheet should contain:
+
+1. QC run table with Date/Run and RESULT columns for HQC and LQC values
+2. HQC and LQC summary blocks with QC mean and SD information
+
+Pattern B: Flat table sheet with columns such as:
+
+1. analyte/compound/name
+2. date (or run date)
+3. either HQC/LQC value columns, or
+4. qc level + concentration/value columns
+
+This upload creates/updates:
+
+1. runs
+2. samples
+3. analytes
+4. results
+5. (if present) qc_targets from summary tables
+
+### 2) Upload Mean/SD Targets File (CSV or Excel)
+
+Accepted file types:
+
+1. .csv
+2. .xls
+3. .xlsx
+
+Minimum required target fields:
+
+1. analyte
+2. qc_level (High/HQC or Low/LQC)
+3. target_mean (QC mean)
+4. target_sd (provided SD)
+
+Optional target fields:
+
+1. effective_from
+2. effective_to
+3. lot_number
+
+For workbook-style Excel targets, each analyte sheet should have HQC/LQC summary tables where the app can read:
+
+1. QC mean
+2. SD (or values from which SD can be derived: ±2SD, ±3SD, or %CV)
+
+### To get correct charts
+
+1. Import QC data file first (for data points).
+2. Import targets file (or workbook with summary tables) for mean/2SD/3SD lines.
+3. If parser logic changed, re-import the targets file so stored target rows are refreshed.
+
+---
+
 ## Troubleshooting
 
 If something looks wrong:
