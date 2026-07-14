@@ -1,1 +1,0 @@
-"""QC Studio package (incremental refactor scaffold)."""
