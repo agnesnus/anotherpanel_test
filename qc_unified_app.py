@@ -285,44 +285,7 @@ def get_db_download_bytes(db_path=None):
         return None
     return db_path.read_bytes()
 
-def delete_database_file(db_path=None):
-    db_path = Path(db_path or DB_PATH)
-    if db_path.exists():
-        db_path.unlink()
-        return True
-    return False
 
-# --- In main(), inside mode == "Database": add a DB management block ---
-st.markdown("---")
-st.subheader("🗄️ Database File Management")
-st.code(f"{DB_PATH}", language="text")
-st.caption("Default DB path is repo-local unless QC_STUDIO_DB_PATH is set.")
-
-db_bytes = get_db_download_bytes()
-if db_bytes is None:
-    st.info("Database file does not exist yet. Import a file first.")
-else:
-    st.download_button(
-        label="📥 Download current database (.db)",
-        data=db_bytes,
-        file_name=DB_PATH.name,  # usually test_panel.db
-        mime="application/octet-stream",
-        use_container_width=True,
-    )
-
-with st.expander("⚠️ Danger Zone"):
-    st.warning("This permanently deletes the database file and all imported data.")
-    confirm_delete = st.checkbox("I understand this cannot be undone.", key="confirm_delete_db")
-    if st.button("🗑️ Delete database file and reset", use_container_width=True, disabled=not confirm_delete):
-        try:
-            deleted = delete_database_file()
-            if deleted:
-                st.success(f"Deleted database: {DB_PATH}")
-                st.rerun()
-            else:
-                st.info("No database file found to delete.")
-        except Exception as e:
-            st.error(f"Failed to delete database: {e}")
 def ensure_uploaded_by_column(conn):
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs'")
@@ -2217,7 +2180,39 @@ def generate_final_report(db_path=None):
 # ==============================================================================
 # STREAMLIT APP
 # ==============================================================================
+def render_database_file_management():
+    """Render database file download/delete controls (Database tab only)."""
+    st.markdown("---")
+    st.subheader("🗄️ Database File Management")
+    st.code(f"{DB_PATH}", language="text")
+    st.caption("Default DB path is repo-local unless QC_STUDIO_DB_PATH is set.")
 
+    db_bytes = get_db_download_bytes()
+    if db_bytes is None:
+        st.info("Database file does not exist yet. Import a file first.")
+    else:
+        st.download_button(
+            label="📥 Download current database (.db)",
+            data=db_bytes,
+            file_name=DB_PATH.name,
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+
+    with st.expander("⚠️ Danger Zone"):
+        st.warning("This permanently deletes the database file and all imported data.")
+        confirm_delete = st.checkbox("I understand this cannot be undone.", key="confirm_delete_db")
+        if st.button("🗑️ Delete database file and reset", use_container_width=True, disabled=not confirm_delete):
+            try:
+                deleted = delete_database_file()
+                if deleted:
+                    st.success(f"Deleted database: {DB_PATH}")
+                    st.rerun()
+                else:
+                    st.info("No database file found to delete.")
+            except Exception as e:
+                st.error(f"Failed to delete database: {e}")
+                
 def main():
     st.set_page_config(page_title="QC Studio", layout="wide")
     st.title("🧪 QC Studio")
@@ -2282,7 +2277,8 @@ def main():
                         os.unlink(tmp_path)
 
         st.markdown("---")
-
+        render_database_file_management()
+        
         st.subheader("📋 Run Summary")
         df_runs = query_run_summary()
         if df_runs.empty:
