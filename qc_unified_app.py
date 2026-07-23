@@ -199,7 +199,7 @@ CREATE INDEX IF NOT EXISTS idx_qc_targets_lookup ON qc_targets(analyte_id, qc_le
 # SampleInfo is imported from qc_studio.models.
 # Keep a single source of truth and avoid redefining it here.
 
- def main():
+def main():
     # Validate DB path early so the app fails with actionable guidance.
     ensure_persistent_db_path_ready(DB_PATH)
     # Optional safety net: one snapshot backup per day.
