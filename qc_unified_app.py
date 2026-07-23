@@ -25,8 +25,7 @@ import os
 import shutil
 from io import BytesIO
 from urllib.parse import quote
-from qc_studio.config import DB_PATH, SAMPLE_TYPES
-from qc_studio.schema import SCHEMA_SQL
+from qc_studio.config import SAMPLE_TYPES
 from qc_studio.models import SampleInfo
 from qc_studio.db import (
     get_connection,
@@ -34,122 +33,14 @@ from qc_studio.db import (
     get_db_download_bytes,
     delete_database_file,
 )
-@@
--from qc_studio.config import DB_PATH, SAMPLE_TYPES
--from qc_studio.schema import SCHEMA_SQL
--from qc_studio.models import SampleInfo
-+from qc_studio.config import SAMPLE_TYPES
-+from qc_studio.models import SampleInfo
-@@
--# Persistent DB location:
--# 1) Use QC_STUDIO_DB_PATH env var if set
--# 2) Else default to a workspace-local file
--# Keep DB inside this repo folder, regardless of launch directory
--REPO_ROOT = Path(__file__).resolve().parent
--DB_PATH = Path(os.getenv("QC_STUDIO_DB_PATH", str(REPO_ROOT / "test_panel.db"))).resolve()
-+# Persistent DB location:
-+# 1) Use QC_STUDIO_DB_PATH env var if set (RECOMMENDED: point this to a persistent mounted volume)
-+# 2) Else default to a repo-local file (may be ephemeral depending on hosting platform)
-+REPO_ROOT = Path(__file__).resolve().parent
-+DB_PATH = Path(os.getenv("QC_STUDIO_DB_PATH", str(REPO_ROOT / "test_panel.db"))).resolve()
-+
-+def ensure_persistent_db_path_ready(db_path: Path) -> None:
-+    """
-+    Ensure DB directory exists and is writable.
-+    Fail fast with a clear message if path is not usable.
-+    """
-+    db_path.parent.mkdir(parents=True, exist_ok=True)
-+    probe = db_path.parent / ".qc_studio_write_test"
-+    try:
-+        with open(probe, "w", encoding="utf-8") as f:
-+            f.write("ok")
-+        probe.unlink(missing_ok=True)
-+    except Exception as e:
-+        raise RuntimeError(
-+            f"Database directory is not writable: {db_path.parent}\n"
-+            f"Set QC_STUDIO_DB_PATH to a writable persistent path.\n"
-+            f"Original error: {e}"
-+        )
-+
-+def backup_database_if_due(db_path: Path, backup_dir_name: str = "backups", max_backups: int = 14) -> None:
-+    """
-+    Create at most one backup per day: backups/test_panel_YYYYMMDD.db
-+    Keeps only the latest `max_backups`.
-+    """
-+    if not db_path.exists():
-+        return
-+
-+    backup_dir = db_path.parent / backup_dir_name
-+    backup_dir.mkdir(parents=True, exist_ok=True)
-+
-+    stamp = datetime.now().strftime("%Y%m%d")
-+    backup_file = backup_dir / f"{db_path.stem}_{stamp}{db_path.suffix}"
-+    if not backup_file.exists():
-+        shutil.copy2(db_path, backup_file)
-+
-+    # retention
-+    backups = sorted(
-+        backup_dir.glob(f"{db_path.stem}_*{db_path.suffix}"),
-+        key=lambda p: p.stat().st_mtime,
-+        reverse=True,
-+    )
-+    for old in backups[max_backups:]:
-+        old.unlink(missing_ok=True)
-@@
--@dataclass
--class SampleInfo:
--    data_filename: str
--    sample_type: str
--    calibrator_level: Optional[str] = None
--    qc_level: Optional[str] = None
--    qc_replicate: Optional[int] = None
--    collection_date: Optional[str] = None
--    patient_sequence: Optional[str] = None
--    eqa_scheme: Optional[str] = None
--    eqa_year: Optional[int] = None
--    eqa_round: Optional[int] = None
--    eqa_sample_code: Optional[str] = None
--    eqa_replicate: Optional[str] = None
-+# NOTE:
-+# SampleInfo is imported from qc_studio.models.
-+# Keep a single source of truth and avoid redefining it here.
-@@
- def main():
-+    # Validate DB path early so the app fails with actionable guidance.
-+    ensure_persistent_db_path_ready(DB_PATH)
-+    # Optional safety net: one snapshot backup per day.
-+    backup_database_if_due(DB_PATH)
-+
-     st.set_page_config(page_title="QC Studio", layout="wide")
-     st.title("🧪 QC Studio")
-     st.markdown("Integrated QC panel database, QC export, and dashboard platform")
-     st.sidebar.caption(f"DB: {DB_PATH}")
-+    if "QC_STUDIO_DB_PATH" not in os.environ:
-+        st.sidebar.warning("Using fallback local DB path (may be ephemeral on this host).")
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
+
 
 # Persistent DB location:
-# 1) Use QC_STUDIO_DB_PATH env var if set
-# 2) Else default to a workspace-local file
-# Keep DB inside this repo folder, regardless of launch directory
+# 1) Use QC_STUDIO_DB_PATH env var if set (RECOMMENDED: point this to a persistent mounted volume)
+# 2) Else default to a repo-local file (may be ephemeral depending on hosting platform)
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("QC_STUDIO_DB_PATH", str(REPO_ROOT / "test_panel.db"))).resolve()
 
-# right after DB_PATH is defined
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-try:
-    with open(DB_PATH.parent / ".write_test", "w") as f:
-        f.write("ok")
-    (DB_PATH.parent / ".write_test").unlink(missing_ok=True)
-except Exception as e:
-    raise RuntimeError(
-        f"Database directory is not writable: {DB_PATH.parent}. "
-        f"Set QC_STUDIO_DB_PATH to a writable persistent path. Error: {e}"
-    )
-    
 SAMPLE_TYPES = [
     {"type_code": "calibrator", "description": "Calibration standards (Cal 0 through Cal F)"},
     {"type_code": "qc", "description": "Quality control samples (Low/High)"},
@@ -158,6 +49,51 @@ SAMPLE_TYPES = [
     {"type_code": "blank", "description": "Solvent blanks"},
     {"type_code": "process_blank", "description": "Process/extraction blanks"},
 ]
+
+
+def ensure_persistent_db_path_ready(db_path: Path) -> None:
+    """
+    Ensure DB directory exists and is writable.
+    Fail fast with a clear message if path is not usable.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    probe = db_path.parent / ".qc_studio_write_test"
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Database directory is not writable: {db_path.parent}\n"
+            f"Set QC_STUDIO_DB_PATH to a writable persistent path.\n"
+            f"Original error: {e}"
+        )
+
+def backup_database_if_due(db_path: Path, backup_dir_name: str = "backups", max_backups: int = 14) -> None:
+    """
+    Create at most one backup per day: backups/test_panel_YYYYMMDD.db
+    Keeps only the latest `max_backups`.
+    """
+    if not db_path.exists():
+        return
+
+    backup_dir = db_path.parent / backup_dir_name
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    backup_file = backup_dir / f"{db_path.stem}_{stamp}{db_path.suffix}"
+    if not backup_file.exists():
+        shutil.copy2(db_path, backup_file)
+
+    # retention
+    backups = sorted(
+        backup_dir.glob(f"{db_path.stem}_*{db_path.suffix}"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in backups[max_backups:]:
+        old.unlink(missing_ok=True)
+
 
 # ==============================================================================
 # SQL SCHEMA
@@ -259,20 +195,23 @@ CREATE INDEX IF NOT EXISTS idx_qc_targets_lookup ON qc_targets(analyte_id, qc_le
 # SAMPLE CLASSIFIER
 # ==============================================================================
 
-@dataclass
-class SampleInfo:
-    data_filename: str
-    sample_type: str
-    calibrator_level: Optional[str] = None
-    qc_level: Optional[str] = None
-    qc_replicate: Optional[int] = None
-    collection_date: Optional[str] = None
-    patient_sequence: Optional[str] = None
-    eqa_scheme: Optional[str] = None
-    eqa_year: Optional[int] = None
-    eqa_round: Optional[int] = None
-    eqa_sample_code: Optional[str] = None
-    eqa_replicate: Optional[str] = None
+# NOTE:
+# SampleInfo is imported from qc_studio.models.
+# Keep a single source of truth and avoid redefining it here.
+
+ def main():
+    # Validate DB path early so the app fails with actionable guidance.
+    ensure_persistent_db_path_ready(DB_PATH)
+    # Optional safety net: one snapshot backup per day.
+    backup_database_if_due(DB_PATH)
+
+     st.set_page_config(page_title="QC Studio", layout="wide")
+     st.title("🧪 QC Studio")
+     st.markdown("Integrated QC panel database, QC export, and dashboard platform")
+     st.sidebar.caption(f"DB: {DB_PATH}")
+    if "QC_STUDIO_DB_PATH" not in os.environ:
+        st.sidebar.warning("Using fallback local DB path (may be ephemeral on this host).")
+
 
 
 def classify_sample(data_filename: str) -> SampleInfo:
