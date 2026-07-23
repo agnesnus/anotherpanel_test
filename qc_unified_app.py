@@ -205,10 +205,10 @@ def main():
     # Optional safety net: one snapshot backup per day.
     backup_database_if_due(DB_PATH)
 
-     st.set_page_config(page_title="QC Studio", layout="wide")
-     st.title("🧪 QC Studio")
-     st.markdown("Integrated QC panel database, QC export, and dashboard platform")
-     st.sidebar.caption(f"DB: {DB_PATH}")
+    st.set_page_config(page_title="QC Studio", layout="wide")
+    st.title("🧪 QC Studio")
+    st.markdown("Integrated QC panel database, QC export, and dashboard platform")
+    st.sidebar.caption(f"DB: {DB_PATH}")
     if "QC_STUDIO_DB_PATH" not in os.environ:
         st.sidebar.warning("Using fallback local DB path (may be ephemeral on this host).")
 
