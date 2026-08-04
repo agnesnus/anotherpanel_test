@@ -383,7 +383,7 @@ def _require_columns(df, required_aliases_map):
 def _extract_new_csv_structure(csv_path: str):
     """
     Supports both common 'new' layouts:
-    1) Two-row header layout (row0 analyte '... Results', row1 metadata labels)
+    1) Two-row header layout (row0 analyte ' Results', row1 metadata labels)
     2) Single-row flat table with explicit columns.
     Returns:
       df_meta, analyte_columns (list of tuples: real_col_idx, analyte_name), col_map, first_data_path
@@ -2244,157 +2244,160 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Database:** `{DB_PATH.name}`")
 
-    if mode == "Database":
-        st.header("📊 QC Panel Database")
+if mode == "Database":
+    st.header("📊 QC Panel Database")
 
-        st.info("💡 **How it works:** Upload CSV or Excel files to automatically create and populate the database. The schema and reference data are generated on-demand from your first file upload.")
+    st.info("💡 **How it works:** Upload CSV or Excel files to automatically create and populate the database. The schema and reference data are generated on-demand from your first file upload.")
 
-        col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-        with col1:
-            initials = st.text_input(
-                "Enter your initials",
-                max_chars=6,
-                key="qc_uploader_initials",
-                help="Enter the initials of the user uploading this QC file. Leave blank if not available."
-            )
+    with col1:
+        initials = st.text_input(
+            "Enter your initials",
+            max_chars=6,
+            key="qc_uploader_initials",
+            help="Enter the initials of the user uploading this QC file. Leave blank if not available."
+        )
 
-            # 👇 Add panel picker here (before file uploader)
-            selected_panel_name = st.selectbox(
-                "Select panel for this upload",
-                list(PANEL_MAP.keys()),
-                key="upload_panel",
-            )
-            selected_panel_id = PANEL_MAP[selected_panel_name]
+        selected_panel_name = st.selectbox(
+            "Select panel for this upload",
+            list(PANEL_MAP.keys()),
+            key="upload_panel",
+        )
+        selected_panel_id = PANEL_MAP[selected_panel_name]
 
-            uploaded_file = st.file_uploader(
-                "📁 Import QC Data (CSV or Excel)",
-                type=["csv", "xls", "xlsx"],
-                key="qc_data_uploader"
-            )
-uploaded_file = st.file_uploader(...)
+        uploaded_file = st.file_uploader(
+            "📁 Import QC Data (CSV or Excel)",
+            type=["csv", "xls", "xlsx"],
+            key="qc_data_uploader"
+        )
 
-if uploaded_file:
-    tmp_path = None
-    try:
-        initials = str(initials).strip().upper() if initials else None
-        with st.spinner("Importing QC data..."):
-            suffix = Path(uploaded_file.name).suffix.lower()
-            if suffix == ".csv":
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                    tmp.write(uploaded_file.getbuffer())
-                    tmp_path = tmp.name
+        if uploaded_file:
+            tmp_path = None
+            try:
+                initials = str(initials).strip().upper() if initials else None
+                with st.spinner("Importing QC data"):
+                    suffix = Path(uploaded_file.name).suffix.lower()
 
-                # ✅ place CSV import call here
-                result = import_csv(
-                    tmp_path,
-                    uploaded_by=initials,
-                    original_filename=uploaded_file.name,
-                    panel_id=selected_panel_id,
-                )
+                    if suffix == ".csv":
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                            tmp.write(uploaded_file.getbuffer())
+                            tmp_path = tmp.name
 
-            elif suffix in {".xls", ".xlsx"}:
-                # ✅ place Excel import call here
-                result = import_excel_qc_file(
-                    uploaded_file.read(),
-                    uploaded_file.name,
-                    uploaded_by=initials,
-                    panel_id=selected_panel_id,
-                )
-            else:
-                raise ValueError("Unsupported file type. Upload a CSV or Excel file.")
+                        result = import_csv(
+                            tmp_path,
+                            uploaded_by=initials,
+                            original_filename=uploaded_file.name,
+                            panel_id=selected_panel_id,
+                        )
 
-        st.success(result)
-    except Exception as e:
-        st.error(f"Import failed: {e}")
-    finally:
-        if tmp_path and Path(tmp_path).exists():
-            os.unlink(tmp_path)
-        st.markdown("---")
-        render_database_file_management()
-        
-        st.subheader("📋 Run Summary")
-        df_runs = query_run_summary()
-        if df_runs.empty:
-            st.info("No data imported yet. Upload a CSV file to get started.")
+                    elif suffix in {".xls", ".xlsx"}:
+                        result = import_excel_qc_file(
+                            uploaded_file.read(),
+                            uploaded_file.name,
+                            uploaded_by=initials,
+                            panel_id=selected_panel_id,
+                        )
+
+                    else:
+                        raise ValueError("Unsupported file type. Upload a CSV or Excel file.")
+
+                st.success(result)
+                get_qc_data.clear() if hasattr(get_qc_data, "clear") else None
+
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+
+            finally:
+                if tmp_path and Path(tmp_path).exists():
+                    os.unlink(tmp_path)
+
+    st.markdown("---")
+    render_database_file_management()
+
+    st.subheader("📋 Run Summary")
+    df_runs = query_run_summary()  # later: query_run_summary(panel_id=...)
+    if df_runs.empty:
+        st.info("No data imported yet. Upload a CSV file to get started.")
+    else:
+        st.dataframe(df_runs, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("🎯 QC Targets Manager")
+    st.markdown("View existing mean/SD targets per analyte and add new ones when lot changes.")
+
+    df_targets = get_all_qc_targets()
+    if df_targets.empty:
+        st.info("No QC targets stored yet. Import an Excel workbook or add one manually below.")
+    else:
+        st.dataframe(df_targets, use_container_width=True, hide_index=True)
+
+    with st.expander("📤 Upload Mean/SD Targets File"):
+        st.caption(
+            "Upload CSV/Excel with columns: analyte, qc_level, target_mean, target_sd, "
+            "and optional effective_from, effective_to, lot_number."
+        )
+        targets_file = st.file_uploader(
+            "Upload targets file",
+            type=["csv", "xls", "xlsx"],
+            key="qc_targets_file_uploader",
+        )
+        if targets_file and st.button("⬆️ Import Targets File", use_container_width=True, key="import_targets_file_btn"):
+            try:
+                msg = import_qc_targets_file(targets_file.read(), targets_file.name)
+                st.success(msg)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Targets import failed: {e}")
+
+    with st.expander("➕ Add / Update QC Target"):
+        if not DB_PATH.exists():
+            st.warning("Import data first to initialise the database.")
         else:
-            st.dataframe(df_runs, use_container_width=True)
+            conn_tmp = get_connection()
+            all_analyte_names = [
+                r[0]
+                for r in conn_tmp.execute(
+                    """
+                    SELECT MIN(name) AS name
+                    FROM analytes
+                    GROUP BY lower(name)
+                    ORDER BY lower(name)
+                    """
+                ).fetchall()
+            ]
+            conn_tmp.close()
+            if not all_analyte_names:
+                st.info("No analytes in database yet. Import a data file first to populate analyte names.")
+                all_analyte_names = ["— no analytes —"]
 
-        st.markdown("---")
-        st.subheader("🎯 QC Targets Manager")
-        st.markdown("View existing mean/SD targets per analyte and add new ones when lot changes.")
+            t_col1, t_col2 = st.columns(2)
+            with t_col1:
+                t_analyte = st.selectbox("Analyte", all_analyte_names, key="t_analyte")
+                t_level = st.selectbox("QC Level", ["High (HQC)", "Low (LQC)"], key="t_level")
+                t_lot = st.text_input("Lot Number (optional)", key="t_lot")
+            with t_col2:
+                t_mean = st.number_input("Target Mean", min_value=0.0, format="%.4f", key="t_mean")
+                t_sd = st.number_input("Target SD", min_value=0.0, format="%.4f", key="t_sd")
+                t_from = st.date_input("Effective From", key="t_from")
+                t_to = st.date_input("Effective To (leave blank = open-ended)", value=None, key="t_to")
 
-        df_targets = get_all_qc_targets()
-        if df_targets.empty:
-            st.info("No QC targets stored yet. Import an Excel workbook or add one manually below.")
-        else:
-            st.dataframe(df_targets, use_container_width=True, hide_index=True)
-
-        with st.expander("📤 Upload Mean/SD Targets File"):
-            st.caption(
-                "Upload CSV/Excel with columns: analyte, qc_level, target_mean, target_sd, "
-                "and optional effective_from, effective_to, lot_number."
-            )
-            targets_file = st.file_uploader(
-                "Upload targets file",
-                type=["csv", "xls", "xlsx"],
-                key="qc_targets_file_uploader",
-            )
-            if targets_file and st.button("⬆️ Import Targets File", use_container_width=True, key="import_targets_file_btn"):
+            if st.button("💾 Save QC Target", use_container_width=True):
                 try:
-                    msg = import_qc_targets_file(targets_file.read(), targets_file.name)
-                    st.success(msg)
+                    level_code = "High" if "High" in t_level else "Low"
+                    insert_qc_target(
+                        analyte_name=t_analyte,
+                        qc_level=level_code,
+                        target_mean=t_mean,
+                        target_sd=t_sd,
+                        effective_from=str(t_from),
+                        effective_to=str(t_to) if t_to else None,
+                        lot_number=t_lot or None,
+                    )
+                    st.success(f"Saved target for {t_analyte} {level_code} effective {t_from}.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Targets import failed: {e}")
-
-        with st.expander("➕ Add / Update QC Target"):
-            if not DB_PATH.exists():
-                st.warning("Import data first to initialise the database.")
-            else:
-                conn_tmp = get_connection()
-                all_analyte_names = [
-                    r[0]
-                    for r in conn_tmp.execute(
-                        """
-                        SELECT MIN(name) AS name
-                        FROM analytes
-                        GROUP BY lower(name)
-                        ORDER BY lower(name)
-                        """
-                    ).fetchall()
-                ]
-                conn_tmp.close()
-                if not all_analyte_names:
-                    st.info("No analytes in database yet. Import a data file first to populate analyte names.")
-                    all_analyte_names = ["— no analytes —"]
-                t_col1, t_col2 = st.columns(2)
-                with t_col1:
-                    t_analyte = st.selectbox("Analyte", all_analyte_names, key="t_analyte")
-                    t_level   = st.selectbox("QC Level", ["High (HQC)", "Low (LQC)"], key="t_level")
-                    t_lot     = st.text_input("Lot Number (optional)", key="t_lot")
-                with t_col2:
-                    t_mean    = st.number_input("Target Mean", min_value=0.0, format="%.4f", key="t_mean")
-                    t_sd      = st.number_input("Target SD",   min_value=0.0, format="%.4f", key="t_sd")
-                    t_from    = st.date_input("Effective From", key="t_from")
-                    t_to      = st.date_input("Effective To (leave blank = open-ended)", value=None, key="t_to")
-
-                if st.button("💾 Save QC Target", use_container_width=True):
-                    try:
-                        level_code = "High" if "High" in t_level else "Low"
-                        insert_qc_target(
-                            analyte_name  = t_analyte,
-                            qc_level      = level_code,
-                            target_mean   = t_mean,
-                            target_sd     = t_sd,
-                            effective_from= str(t_from),
-                            effective_to  = str(t_to) if t_to else None,
-                            lot_number    = t_lot or None,
-                        )
-                        st.success(f"Saved target for {t_analyte} {level_code} effective {t_from}.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to save: {e}")
+                    st.error(f"Failed to save: {e}")
 
     elif mode == "Export":
         st.header("📤 QC Export")
@@ -2417,7 +2420,7 @@ if uploaded_file:
             exported = []
             temp_dir = tempfile.mkdtemp()
 
-            with st.spinner("Generating export files..."):
+            with st.spinner("Generating export files"):
                 for analyte in analytes:
                     analyte_data = df_qc[df_qc["analyte"] == analyte]
                     hqc_data = analyte_data[analyte_data["qc_level"] == "High"].reset_index(drop=True)
