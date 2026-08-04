@@ -50,6 +50,11 @@ SAMPLE_TYPES = [
     {"type_code": "process_blank", "description": "Process/extraction blanks"},
 ]
 
+PANEL_MAP = {
+    "PFAS": 1,
+    "Steroid Hormones": 2,
+}
+PANEL_ID_TO_NAME = {v: k for k, v in PANEL_MAP.items()}
 
 def ensure_persistent_db_path_ready(db_path: Path) -> None:
     """
@@ -497,7 +502,7 @@ def parse_filename_new(filename):
         "method_name": None,
     }
 
-def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
+def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filename=None, panel_id=None):
     """
     Import new-format CSV ONLY.
     Strict QC filter:
@@ -511,7 +516,8 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filen
 
     uploaded_by = str(uploaded_by).strip().upper() if uploaded_by else None
     meta = parse_filename_new(original_filename or csv_path)
-
+    if panel_id is None:
+        panel_id = panel_id
     cursor.execute("SELECT run_id FROM runs WHERE source_filename = ?", (meta["source_filename"],))
     if cursor.fetchone():
         conn.close()
@@ -531,7 +537,7 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filen
 
     cursor.execute(
         "INSERT INTO runs (run_date, panel, source_filename, method_name, data_path, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)",
-        (run_date, meta["panel"], meta["source_filename"], meta["method_name"], first_data_path, uploaded_by)
+        (run_date, panel_id, meta["source_filename"], meta["method_name"], first_data_path, uploaded_by)
     )
     run_id = cursor.lastrowid
 
@@ -540,7 +546,7 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filen
     for i, (_, analyte_name) in enumerate(analyte_cols):
         conn.execute(
             "INSERT OR IGNORE INTO analytes (name, panel, display_order) VALUES (?, ?, ?)",
-            (analyte_name, meta["panel"], i + 1)
+            (analyte_name, panel_id, i + 1)
         )
         row = conn.execute(
             "SELECT analyte_id FROM analytes WHERE lower(name)=lower(?) ORDER BY analyte_id LIMIT 1",
@@ -631,7 +637,8 @@ def import_csv_new(csv_path: str, db_path=None, uploaded_by=None, original_filen
     )
 
 
-def import_csv(csv_path: str, db_path=None, uploaded_by=None, original_filename=None):
+def import_csv(csv_path: str, db_path=None, uploaded_by=None, original_filename=None, panel_id=None):
+    return import_csv_new(csv_path, db_path=db_path, uploaded_by=uploaded_by, original_filename=original_filename, panel_id=panel_id)
     """
     New behavior: only accept new-format CSV with Type/Level/Acq Date-Time style columns.
     """
@@ -1523,7 +1530,7 @@ def import_qc_targets_file(file_bytes, filename, db_path=None):
     return f"Imported/updated {imported} target rows" + (f" (skipped {skipped})" if skipped else "")
 
 
-def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None):
+def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None, panel_id=1):
     """Import QC measurement or mean-value Excel data into the QC database."""
     ensure_db_initialized(db_path)
     conn = get_connection(db_path)
@@ -2251,34 +2258,58 @@ def main():
                 key="qc_uploader_initials",
                 help="Enter the initials of the user uploading this QC file. Leave blank if not available."
             )
+
+            # 👇 Add panel picker here (before file uploader)
+            selected_panel_name = st.selectbox(
+                "Select panel for this upload",
+                list(PANEL_MAP.keys()),
+                key="upload_panel",
+            )
+            selected_panel_id = PANEL_MAP[selected_panel_name]
+
             uploaded_file = st.file_uploader(
                 "📁 Import QC Data (CSV or Excel)",
                 type=["csv", "xls", "xlsx"],
                 key="qc_data_uploader"
             )
-            if uploaded_file:
-                tmp_path = None
-                try:
-                    initials = str(initials).strip().upper() if initials else None
-                    with st.spinner("Importing QC data..."):
-                        suffix = Path(uploaded_file.name).suffix.lower()
-                        if suffix == ".csv":
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                                tmp.write(uploaded_file.getbuffer())
-                                tmp_path = tmp.name
-                            result = import_csv(tmp_path, uploaded_by=initials, original_filename=uploaded_file.name)
-                        elif suffix in {".xls", ".xlsx"}:
-                            result = import_excel_qc_file(uploaded_file.read(), uploaded_file.name, uploaded_by=initials)
-                        else:
-                            raise ValueError("Unsupported file type. Upload a CSV or Excel file.")
-                    st.success(result)
-                    get_qc_data.clear() if hasattr(get_qc_data, 'clear') else None
-                except Exception as e:
-                    st.error(f"Import failed: {e}")
-                finally:
-                    if tmp_path and Path(tmp_path).exists():
-                        os.unlink(tmp_path)
+uploaded_file = st.file_uploader(...)
 
+if uploaded_file:
+    tmp_path = None
+    try:
+        initials = str(initials).strip().upper() if initials else None
+        with st.spinner("Importing QC data..."):
+            suffix = Path(uploaded_file.name).suffix.lower()
+            if suffix == ".csv":
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                    tmp.write(uploaded_file.getbuffer())
+                    tmp_path = tmp.name
+
+                # ✅ place CSV import call here
+                result = import_csv(
+                    tmp_path,
+                    uploaded_by=initials,
+                    original_filename=uploaded_file.name,
+                    panel_id=selected_panel_id,
+                )
+
+            elif suffix in {".xls", ".xlsx"}:
+                # ✅ place Excel import call here
+                result = import_excel_qc_file(
+                    uploaded_file.read(),
+                    uploaded_file.name,
+                    uploaded_by=initials,
+                    panel_id=selected_panel_id,
+                )
+            else:
+                raise ValueError("Unsupported file type. Upload a CSV or Excel file.")
+
+        st.success(result)
+    except Exception as e:
+        st.error(f"Import failed: {e}")
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            os.unlink(tmp_path)
         st.markdown("---")
         render_database_file_management()
         
