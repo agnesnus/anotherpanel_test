@@ -2323,7 +2323,7 @@ if mode == "Database":
     render_database_file_management()
 
     st.subheader("📋 Run Summary")
-   df_runs = query_run_summary(panel_id=panel_id_db)
+    df_runs = query_run_summary(panel_id=panel_id_db)
     if df_runs.empty:
         st.info("No data imported yet. Upload a CSV file to get started.")
     else:
