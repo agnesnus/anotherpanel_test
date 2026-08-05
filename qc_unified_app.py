@@ -2413,7 +2413,7 @@ if mode == "Database":
             list(PANEL_MAP.keys()),
             key="panel_filter_export",
         )
-        panel_id_export = PANEL_MAP[panel_name_export]
+         panel_id_export = PANEL_MAP[panel_name_export]
 
         if not DB_PATH.exists():
             st.error("Database not found. Import data first in the Database tab.")
