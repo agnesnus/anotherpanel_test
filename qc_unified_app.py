@@ -53,6 +53,7 @@ SAMPLE_TYPES = [
 PANEL_MAP = {
     "PFAS": 1,
     "Steroid Hormones": 2,
+    "Test":3,
 }
 PANEL_ID_TO_NAME = {v: k for k, v in PANEL_MAP.items()}
 
