@@ -1735,7 +1735,7 @@ def import_excel_qc_file(file_bytes, filename, db_path=None, uploaded_by=None, p
 # QC DATA QUERIES
 # ==============================================================================
 
-def get_qc_data(db_path=None):
+def get_qc_data(db_path=None, panel_id=None):
     """Pull all QC results from the database."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
@@ -1743,28 +1743,25 @@ def get_qc_data(db_path=None):
 
     conn = get_connection(db_path)
     query = """
-        SELECT
-            r.run_date,
-            a.name as analyte,
-            s.qc_level,
-            r.uploaded_by,
-            AVG(res.concentration) as concentration
-        FROM results res
-        JOIN samples s ON res.sample_id = s.sample_id
-        JOIN runs r ON s.run_id = r.run_id
-        JOIN analytes a ON res.analyte_id = a.analyte_id
-        JOIN sample_types st ON s.sample_type_id = st.type_id
-        WHERE st.type_code = 'qc'
-          AND res.concentration IS NOT NULL
-        GROUP BY r.run_date, a.name, s.qc_level, r.uploaded_by
-        ORDER BY a.name, r.run_date
+    ...
+    WHERE st.type_code = 'qc'
+      AND res.concentration IS NOT NULL
     """
-    df = pd.read_sql_query(query, conn)
+    params = []
+    if panel_id is not None:
+        query += " AND r.panel = ?"
+        params.append(panel_id)
+
+    query += """
+    GROUP BY r.run_date, a.name, s.qc_level, r.uploaded_by
+    ORDER BY a.name, r.run_date
+    """
+    df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return df
 
 
-def get_qc_chart_data(db_path=None):
+def get_qc_chart_data(db_path=None, panel_id=None):
     """Pull raw QC points (no date averaging) for dashboard charting."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
@@ -1793,7 +1790,7 @@ def get_qc_chart_data(db_path=None):
     return df
 
 
-def query_run_summary(db_path=None):
+def query_run_summary(db_path=None, panel_id=None):
     """Get summary of all runs."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
@@ -1812,7 +1809,7 @@ def query_run_summary(db_path=None):
             COUNT(DISTINCT s.sample_id) AS "Samples"
         FROM runs r
         LEFT JOIN samples s ON r.run_id = s.run_id
-        GROUP BY r.run_id ORDER BY r.run_date DESC
+        WHERE 1=1
     """
     df = pd.read_sql_query(query, conn)
     conn.close()
@@ -2112,7 +2109,8 @@ def create_value_pictogram(concentrations, mean_val, sd_val):
     return f"data:image/svg+xml;utf8,{quote(svg)}"
 
 
-def generate_final_report(db_path=None):
+def generate_final_report(db_path=None, panel_id=None):
+    df_qc = get_qc_data(db_path, panel_id=panel_id)
     """Generate comprehensive QC report for all analytes."""
     db_path = db_path or DB_PATH
     if not db_path.exists():
@@ -2247,8 +2245,17 @@ def main():
 if mode == "Database":
     st.header("📊 QC Panel Database")
 
+    panel_name_db = st.sidebar.radio(
+        "Panel",
+        list(PANEL_MAP.keys()),
+        key="panel_filter_database",
+    )
+    panel_id_db = PANEL_MAP[panel_name_db]
+
     st.info("💡 **How it works:** Upload CSV or Excel files to automatically create and populate the database. The schema and reference data are generated on-demand from your first file upload.")
 
+    ...
+    
     col1, col2 = st.columns(2)
 
     with col1:
@@ -2316,7 +2323,7 @@ if mode == "Database":
     render_database_file_management()
 
     st.subheader("📋 Run Summary")
-    df_runs = query_run_summary()  # later: query_run_summary(panel_id=...)
+   df_runs = query_run_summary(panel_id=panel_id_db)
     if df_runs.empty:
         st.info("No data imported yet. Upload a CSV file to get started.")
     else:
@@ -2401,12 +2408,18 @@ if mode == "Database":
 
     elif mode == "Export":
         st.header("📤 QC Export")
+        panel_name_export = st.sidebar.radio(
+            "Panel",
+            list(PANEL_MAP.keys()),
+            key="panel_filter_export",
+        )
+        panel_id_export = PANEL_MAP[panel_name_export]
 
         if not DB_PATH.exists():
             st.error("Database not found. Import data first in the Database tab.")
             return
+        df_qc = get_qc_data(panel_id=panel_id_export)
 
-        df_qc = get_qc_data()
         if df_qc.empty:
             st.info("No QC data found in the database.")
             return
@@ -2449,11 +2462,19 @@ if mode == "Database":
     elif mode == "Dashboard":
         st.header("📈 QC Dashboard")
 
+        panel_name_dashboard = st.sidebar.radio(
+            "Panel",
+            list(PANEL_MAP.keys()),
+            key="panel_filter_dashboard",
+        )
+        panel_id_dashboard = PANEL_MAP[panel_name_dashboard]
+
+    
         if not DB_PATH.exists():
             st.error("Database not found. Import data first in the Database tab.")
             return
 
-        df = get_qc_chart_data()
+        df = get_qc_chart_data(panel_id=panel_id_dashboard)
         if df.empty:
             st.warning("No QC data found in the database. Import data to view charts.")
             return
@@ -2673,12 +2694,18 @@ if mode == "Database":
 
     elif mode == "Report":
         st.header("📋 QC Final Report")
-        
+        panel_name_report = st.sidebar.radio(
+            "Panel",
+            list(PANEL_MAP.keys()),
+            key="panel_filter_report",
+        )
+        panel_id_report = PANEL_MAP[panel_name_report]
+    
         if not DB_PATH.exists():
             st.error("Database not found. Import data first in the Database tab.")
             return
         
-        report_df = generate_final_report()
+        report_df = generate_final_report(panel_id=panel_id_report)
         if report_df is None or report_df.empty:
             st.info("No QC data found in the database.")
             return
